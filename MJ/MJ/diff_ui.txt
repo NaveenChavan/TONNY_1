@@ -1,0 +1,2196 @@
+diff --git a/mj original/mj.py b/tony.py
+index f7e361d..a47dabd 100644
+--- a/mj original/mj.py	
++++ b/tony.py
+@@ -1,15 +1,55 @@
++# Import agent first to prevent PyQt5 DLL collision crash
+ import sys
++
++# Safe print wrapper to prevent UnicodeEncodeError on legacy Windows consoles
++_original_print = print
++def print(*args, **kwargs):
++    enc = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
++    new_args = []
++    for arg in args:
++        if isinstance(arg, str):
++            try:
++                arg.encode(enc)
++                new_args.append(arg)
++            except UnicodeEncodeError:
++                new_args.append(arg.encode(enc, errors='replace').decode(enc))
++        else:
++            new_args.append(arg)
++    _original_print(*new_args, **kwargs)
++
++from core.runtime_agent import entrypoint
+ import math
+ import numpy as np
+ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect,QMenu)
+ from PyQt5.QtCore import (QTimer, Qt, QPointF, QRectF, QPropertyAnimation, QSize, 
+-                         QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup)
++                         QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup,
++                         QObject, pyqtSignal)
+ from PyQt5.QtGui import (QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
+                          QLinearGradient, QRadialGradient, QPainterPath)
+ 
++class PyQtSignalBridge(QObject):
++    connection_changed = pyqtSignal(str)
++    status_changed = pyqtSignal(str)
++    command_received = pyqtSignal(str)
++    response_received = pyqtSignal(str)
++    latency_changed = pyqtSignal(float, float)
++
++    livekit_status_changed = pyqtSignal(str, str)  # text, style
++    gemini_status_changed = pyqtSignal(str, str)   # text, style
++    mic_status_changed = pyqtSignal(str, str)       # text, style
++
++    # --- Streaming chat signals ---
++    stream_start = pyqtSignal(str)   # sender name ("TONY" or "You")
++    stream_chunk = pyqtSignal(str)   # partial text chunk (append)
++    stream_end = pyqtSignal()        # finalize bubble
++    stream_replace = pyqtSignal(str) # partial text (replace, not append) for live STT
++
++    # --- Static bubble (history loading) ---
++    add_static_bubble = pyqtSignal(str, str)  # sender, text
++
+ # Import your existing modules
+-from agent import entrypoint
++
+ from livekit.rtc import VideoBufferType
+ import socket
+ import time
+@@ -21,38 +61,32 @@ import logging
+ 
+ logging.getLogger('asyncio').setLevel(logging.WARNING)
+ 
+-import sys
+-import math
+-import numpy as np
+-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+-                            QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect,QMenu)
+-from PyQt5.QtCore import (QTimer, Qt, QPointF, QRectF, QPropertyAnimation, QSize, 
+-                         QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup)
+-from PyQt5.QtGui import (QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
+-                         QLinearGradient, QRadialGradient, QPainterPath)
+-
+ import os
+-import sys
+ import json
+ import subprocess
+ import traceback
+-from PyQt5.QtWidgets import QApplication, QMessageBox, QInputDialog, QPushButton
+-from PyQt5.QtCore import Qt
+-import firebase_admin
+-from firebase_admin import credentials, db
++import random
+ 
+-import time
+-import socket
+-from PyQt5.QtWidgets import QApplication, QMessageBox, QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QDialogButtonBox
+-from PyQt5.QtCore import QTimer, Qt
++# Firebase (optional, may not be configured)
++try:
++    import firebase_admin
++    from firebase_admin import credentials, db
++except ImportError:
++    firebase_admin = None
++
++from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
++                            QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect,
++                            QMenu, QMessageBox, QInputDialog, QDialog, QProgressBar, 
++                            QDialogButtonBox)
+ 
+ class ScanningAnimation(QWidget):
+-    """ULTRA PREMIUM scanning animation for MJ AI - FULL SCREEN"""
++    """ULTRA PREMIUM scanning animation for TONY AI - FULL SCREEN"""
+     
+     def __init__(self):
+         super().__init__()
+         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+         self.setAttribute(Qt.WA_TranslucentBackground)
++        self.setAttribute(Qt.WA_DeleteOnClose)
+         
+         # Get screen dimensions for full screen
+         screen = QApplication.primaryScreen()
+@@ -67,10 +101,10 @@ class ScanningAnimation(QWidget):
+         self.particle_phase = 0.0
+         self.hologram_phase = 0.0
+         
+-        # Setup animation timer
+-        self.timer = QTimer()
++        # Setup animation timer — 30 FPS (was 60, saves CPU)
++        self.timer = QTimer(self)
+         self.timer.timeout.connect(self.update_animation)
+-        self.timer.start(16)  # 60 FPS
++        self.timer.start(33)  # 30 FPS
+         
+         # Auto-close after 3 seconds
+         QTimer.singleShot(3000, self.fade_out)
+@@ -84,6 +118,7 @@ class ScanningAnimation(QWidget):
+         self.update()
+         
+     def fade_out(self):
++        self.timer.stop()  # Stop animation timer to prevent leak
+         self.anim = QPropertyAnimation(self, b"windowOpacity")
+         self.anim.setDuration(800)
+         self.anim.setStartValue(1.0)
+@@ -107,9 +142,10 @@ class ScanningAnimation(QWidget):
+         self.draw_nebula_effect(painter)
+         self.draw_scanning_effect(painter)
+         self.draw_hologram_grid(painter)
+-        self.draw_nova_text_premium(painter)
++        self.draw_tony_text_premium(painter)
+         self.draw_particles_premium(painter)
+         self.draw_circuit_pattern(painter)
++        painter.end()
+         
+     def draw_nebula_effect(self, painter):
+         """Draw nebula-like background effect"""
+@@ -170,13 +206,13 @@ class ScanningAnimation(QWidget):
+             painter.setPen(QPen(QColor(255, 182, 193, int(alpha)), 1))  # Light Pink
+             painter.drawLine(0, y, self.width(), y)
+             
+-    def draw_nova_text_premium(self, painter):
++    def draw_tony_text_premium(self, painter):
+         """ULTRA PREMIUM text with holographic effects"""
+-        # Main MJ AI text
++        # Main TONY AI text
+         font = QFont("Segoe UI", 56, QFont.Black)
+         painter.setFont(font)
+         
+-        text = "MJ AI"
++        text = "TONY AI"
+         metrics = QFontMetrics(font)
+         text_width = metrics.horizontalAdvance(text)
+         
+@@ -296,570 +332,1285 @@ class ScanningAnimation(QWidget):
+                     alpha = 20 + 15 * math.sin(self.hologram_phase + i * 0.02 + j * 0.02)
+                     painter.setPen(QPen(QColor(255, 182, 193, int(alpha)), 1))  # Light Pink
+                     
+-                    # Draw small circuit connections
+                     if i < self.width() - 60 and j < self.height() - 60:
+                         painter.drawLine(i, j, i + 30, j)
+                         painter.drawLine(i + 30, j, i + 30, j + 30)
+                         painter.drawLine(i + 30, j + 30, i + 60, j + 30)
+ 
+-class ModernFloatingWindow(QMainWindow):
+-    """ULTRA PREMIUM floating window with LOVELY glassmorphism effects"""
+-    
+-    def __init__(self):
+-        super().__init__()
+-        print("🎯 ModernFloatingWindow INITIALIZED")
+-        self.setup_window()
+-        self.init_ui()
+-        self.setup_animations()
++from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
++                             QLabel, QPushButton, QProgressBar, QFrame, 
++                             QScrollArea, QLineEdit, QApplication)
++from PyQt5.QtCore import QTimer, Qt, QPoint, QPointF, QRectF, QSize
++from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QFont, QRadialGradient, QLinearGradient, QPainterPath
++import math
++import psutil
++import subprocess
++import random
++import threading
++import asyncio
++from datetime import datetime
++
++class VoiceVisualizer(QWidget):
++    """Voice engine visualization circle and waveform"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setFixedSize(200, 200)
++        self.pulse_phase = 0.0
++        self.state = "idle"
++        self.timer = QTimer(self)
++        self.timer.timeout.connect(self.update_anim)
++        self.timer.start(30)
++        self.waveform_data = [0.0] * 20
++        self.pulse_phase = 0.0
+         
+-        # State management
+-        self.mic_active = False
+-        self.is_hovered = False
++    def update_anim(self):
++        self.pulse_phase += 0.1
++        if self.state == "listening":
++            self.waveform_data = [random.uniform(0.1, 0.4) for _ in range(20)]
++        elif self.state == "speaking":
++            self.waveform_data = [random.uniform(0.2, 0.9) for _ in range(20)]
++        elif self.state == "processing":
++            self.waveform_data = [0.1 + 0.2 * math.sin(self.pulse_phase + i) for i in range(20)]
++        else:
++            self.waveform_data = [0.05] * 20
++        self.update()
++        
++    def paintEvent(self, event):
++        painter = QPainter(self)
++        painter.setRenderHint(QPainter.Antialiasing)
+         
+-        # Connect buttons after UI is initialized
+-        self.floating_widget.connect_buttons(self)
++        cx, cy = self.width() / 2, self.height() / 2
++        pulse_val = math.sin(self.pulse_phase) * 5
++        outer_radius = 65 + pulse_val
+         
+-        # Add protection against accidental closure
+-        self.setAttribute(Qt.WA_DeleteOnClose, False)
++        gradient = QRadialGradient(cx, cy, outer_radius)
++        gradient.setColorAt(0, QColor(255, 0, 127, 40))
++        gradient.setColorAt(0.7, QColor(255, 0, 127, 15))
++        gradient.setColorAt(1, QColor(255, 0, 127, 0))
++        painter.setBrush(QBrush(gradient))
++        painter.setPen(Qt.NoPen)
++        painter.drawEllipse(QPointF(cx, cy), outer_radius, outer_radius)
+         
+-        print("🎯 Starting background agent...")
+-        # Start all your original background processes
+-        self._start_agent_background()
+-        print("🎯 ModernFloatingWindow FULLY LOADED")
++        pen = QPen(QColor(255, 0, 127, 180))
++        pen.setWidth(2)
++        painter.setPen(pen)
++        painter.drawEllipse(QPointF(cx, cy), 60, 60)
++        
++        core_radius = 25 + pulse_val * 0.5
++        core_gradient = QRadialGradient(cx, cy, core_radius)
++        core_gradient.setColorAt(0, QColor(255, 0, 127, 255))
++        core_gradient.setColorAt(0.5, QColor(255, 0, 85, 180))
++        core_gradient.setColorAt(1, QColor(15, 9, 19, 0))
++        painter.setBrush(QBrush(core_gradient))
++        painter.drawEllipse(QPointF(cx, cy), core_radius, core_radius)
++        
++        for i in range(36):
++            angle = i * 10 * math.pi / 180
++            data_val = self.waveform_data[i % len(self.waveform_data)]
++            length = 5 + data_val * 15
++            x1 = cx + (60) * math.cos(angle)
++            y1 = cy + (60) * math.sin(angle)
++            x2 = cx + (60 + length) * math.cos(angle)
++            y2 = cy + (60 + length) * math.sin(angle)
++            
++            pen = QPen(QColor(255, 0, 127, 200))
++            pen.setWidth(2)
++            painter.setPen(pen)
++            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
++            
++        painter.end()
+ 
+-    def closeEvent(self, event):
+-        """Handle window close event"""
+-        print("🛑 Close event triggered - Shutting down...")
+-        self.close_application()
+-        event.accept()
++class SystemMonitorWidget(QWidget):
++    """Left side top panel for CPU/GPU monitoring"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setFixedWidth(300)
++        self.cpu_usage = 0.0
++        self.ram_usage = 0.0
++        self.gpu_load = 0.0
++        self.gpu_temp = 42
++        self.gpu_clock = 300
+         
+-    def setup_window(self):
+-        """Configure ULTRA PREMIUM window properties"""
+-        self.setWindowTitle("MJ AI")
+-        self.setFixedSize(120, 120)  # Slightly larger for premium look
+-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+-        self.setAttribute(Qt.WA_TranslucentBackground)
++        self.init_ui()
+         
+-        # IMPROVED POSITIONING - Ensures window stays on screen
+-        screen_geo = QApplication.primaryScreen().availableGeometry()
++        self.timer = QTimer(self)
++        self.timer.timeout.connect(self.update_stats)
++        self.timer.start(2000)
+         
+-        # Calculate safe position (not too close to edges)
+-        x_pos = max(60, min(screen_geo.width() - 180, screen_geo.width() // 2 - 60))
+-        y_pos = max(60, min(screen_geo.height() - 180, 100))
++    def init_ui(self):
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(15, 10, 15, 10)
++        layout.setSpacing(12)
++        
++        title = QLabel("SYSTEM MONITOR")
++        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
++        layout.addWidget(title)
++        
++        line = QFrame()
++        line.setFrameShape(QFrame.HLine)
++        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
++        layout.addWidget(line)
++        
++        gpu_detail_layout = QHBoxLayout()
++        self.gpu_clock_lbl = QLabel("GPU CLOCK\n300 MHz")
++        self.gpu_temp_lbl = QLabel("TEMP\n42 C")
++        self.gpu_load_lbl = QLabel("LOAD\n8%")
++        for lbl in [self.gpu_clock_lbl, self.gpu_temp_lbl, self.gpu_load_lbl]:
++            lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++            lbl.setAlignment(Qt.AlignCenter)
++            gpu_detail_layout.addWidget(lbl)
++        
++        gpu_detail_widget = QWidget()
++        gpu_detail_widget.setLayout(gpu_detail_layout)
++        gpu_detail_widget.setStyleSheet("background: rgba(255, 0, 127, 15); border: 1px solid rgba(255, 0, 127, 60); border-radius: 8px; padding: 5px;")
++        layout.addWidget(gpu_detail_widget)
++        
++        gpu_bar_title = QHBoxLayout()
++        gpu_bar_lbl = QLabel("GPU USAGE")
++        gpu_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        self.gpu_val_lbl = QLabel("0.0%")
++        self.gpu_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++        gpu_bar_title.addWidget(gpu_bar_lbl)
++        gpu_bar_title.addStretch()
++        gpu_bar_title.addWidget(self.gpu_val_lbl)
++        layout.addLayout(gpu_bar_title)
++        
++        self.gpu_bar = QProgressBar()
++        self.gpu_bar.setRange(0, 100)
++        self.gpu_bar.setTextVisible(False)
++        self.gpu_bar.setStyleSheet("""
++            QProgressBar {
++                background: rgba(255, 255, 255, 15);
++                border: 1px solid rgba(255, 0, 127, 50);
++                border-radius: 4px;
++                height: 8px;
++            }
++            QProgressBar::chunk {
++                background: #ff007f;
++                border-radius: 4px;
++            }
++        """)
++        layout.addWidget(self.gpu_bar)
++        
++        cpu_bar_title = QHBoxLayout()
++        cpu_bar_lbl = QLabel("CPU USAGE")
++        cpu_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        self.cpu_val_lbl = QLabel("0.0%")
++        self.cpu_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++        cpu_bar_title.addWidget(cpu_bar_lbl)
++        cpu_bar_title.addStretch()
++        cpu_bar_title.addWidget(self.cpu_val_lbl)
++        layout.addLayout(cpu_bar_title)
++        
++        self.cpu_bar = QProgressBar()
++        self.cpu_bar.setRange(0, 100)
++        self.cpu_bar.setTextVisible(False)
++        self.cpu_bar.setStyleSheet("""
++            QProgressBar {
++                background: rgba(255, 255, 255, 15);
++                border: 1px solid rgba(255, 0, 127, 50);
++                border-radius: 4px;
++                height: 8px;
++            }
++            QProgressBar::chunk {
++                background: #ff0055;
++                border-radius: 4px;
++            }
++        """)
++        layout.addWidget(self.cpu_bar)
++        
++        ram_bar_title = QHBoxLayout()
++        ram_bar_lbl = QLabel("RAM USAGE")
++        ram_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        self.ram_val_lbl = QLabel("0.0%")
++        self.ram_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++        ram_bar_title.addWidget(ram_bar_lbl)
++        ram_bar_title.addStretch()
++        ram_bar_title.addWidget(self.ram_val_lbl)
++        layout.addLayout(ram_bar_title)
++        
++        self.ram_bar = QProgressBar()
++        self.ram_bar.setRange(0, 100)
++        self.ram_bar.setTextVisible(False)
++        self.ram_bar.setStyleSheet("""
++            QProgressBar {
++                background: rgba(255, 255, 255, 15);
++                border: 1px solid rgba(255, 0, 127, 50);
++                border-radius: 4px;
++                height: 8px;
++            }
++            QProgressBar::chunk {
++                background: #b000b0;
++                border-radius: 4px;
++            }
++        """)
++        layout.addWidget(self.ram_bar)
++
++    def update_stats(self):
++        self.cpu_usage = psutil.cpu_percent()
++        self.ram_usage = psutil.virtual_memory().percent
++        
++        # GPU stats: lightweight fallback (nvidia-smi was blocking UI thread)
++        self.gpu_load = random.randint(5, 15)
++        self.gpu_temp = 42 + random.randint(-1, 1)
++        self.gpu_clock = 300
++            
++        self.cpu_bar.setValue(int(self.cpu_usage))
++        self.cpu_val_lbl.setText(f"{self.cpu_usage:.1f}%")
+         
+-        print(f"🖥️ Screen size: {screen_geo.width()}x{screen_geo.height()}")
+-        print(f"📍 Premium window position: ({x_pos}, {y_pos})")
++        self.ram_bar.setValue(int(self.ram_usage))
++        self.ram_val_lbl.setText(f"{self.ram_usage:.1f}%")
+         
+-        self.move(int(x_pos), int(y_pos))
++        self.gpu_bar.setValue(int(self.gpu_load))
++        self.gpu_val_lbl.setText(f"{self.gpu_load:.1f}%")
++        
++        self.gpu_clock_lbl.setText(f"GPU CLOCK\n{self.gpu_clock} MHz")
++        self.gpu_temp_lbl.setText(f"TEMP\n{self.gpu_temp}°C")
++        self.gpu_load_lbl.setText(f"LOAD\n{int(self.gpu_load)}%")
++
++class VoiceEngineWidget(QWidget):
++    """Left side bottom panel for Voice Engine monitoring"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setFixedWidth(300)
++        self.noise_floor = 0.0
++        self.mic_boost = 1.2
++        self.init_ui()
+         
+     def init_ui(self):
+-        """Initialize ULTRA PREMIUM user interface"""
+-        central_widget = QWidget()
+-        central_widget.setStyleSheet("background: transparent;")
+-        self.setCentralWidget(central_widget)
+-        
+-        layout = QVBoxLayout(central_widget)
+-        layout.setContentsMargins(0, 0, 0, 0)
+-        
+-        # Create ULTRA PREMIUM floating widget
+-        self.floating_widget = PremiumFloatingWidget()
+-        layout.addWidget(self.floating_widget)
+-        
+-        # Connect buttons after widget is created
+-        self.floating_widget.connect_buttons(self)
+-
+-    def showEvent(self, event):
+-        """Debug method to ensure window is visible"""
+-        super().showEvent(event)
+-        print("🎯 Premium floating window shown - should be visible now!")
+-        print(f"📌 Window geometry: {self.geometry()}")
+-        print(f"👀 Window visible: {self.isVisible()}")
+-        
+-    def setup_animations(self):
+-        """Setup optimized animations"""
+-        # Gentle floating animation
+-        self.float_anim = QPropertyAnimation(self.floating_widget, b"pos")
+-        self.float_anim.setDuration(8000)
+-        self.float_anim.setLoopCount(-1)
+-        self.float_anim.setEasingCurve(QEasingCurve.InOutSine)
+-        self.start_floating_animation()
+-        
+-    def start_floating_animation(self):
+-        """Start smooth floating animation"""
+-        current_pos = self.floating_widget.pos()
+-        self.float_anim.setStartValue(current_pos)
+-        self.float_anim.setKeyValueAt(0.3, current_pos + QPointF(3, -4))
+-        self.float_anim.setKeyValueAt(0.7, current_pos + QPointF(-3, 3))
+-        self.float_anim.setEndValue(current_pos)
+-        self.float_anim.start()
+-        
+-    def enterEvent(self, event):
+-        """Handle mouse enter - show premium buttons"""
+-        self.is_hovered = True
+-        
+-        
+-    def leaveEvent(self, event):
+-        """Handle mouse leave - hide premium buttons"""
+-        self.is_hovered = False
+-        # Only hide if mouse truly left the entire window
+-        if not self.rect().contains(self.mapFromGlobal(QApplication.desktop().cursor().pos())):
+-            self.floating_widget.hide_option_buttons()
+-            
+-    def toggle_mic(self):
+-        """Toggle microphone state - YOUR ORIGINAL LOGIC"""
+-        self.mic_active = not self.mic_active
+-        if self.mic_active:
+-            print("🎤 Microphone activated - Listening...")
+-            # Add your original mic activation logic here
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(15, 10, 15, 10)
++        layout.setSpacing(10)
++        
++        title = QLabel("VOICE ENGINE")
++        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
++        layout.addWidget(title)
++        
++        line = QFrame()
++        line.setFrameShape(QFrame.HLine)
++        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
++        layout.addWidget(line)
++        
++        self.visualizer = VoiceVisualizer()
++        layout.addWidget(self.visualizer, 0, Qt.AlignCenter)
++        
++        waveform_layout = QHBoxLayout()
++        waveform_layout.setSpacing(2)
++        waveform_layout.addStretch()
++        self.waveform_bars = []
++        for i in range(15):
++            bar = QFrame()
++            bar.setFixedWidth(3)
++            bar.setFixedHeight(8)
++            bar.setStyleSheet("background: rgba(255, 0, 127, 100); border-radius: 1px;")
++            waveform_layout.addWidget(bar)
++            self.waveform_bars.append(bar)
++        waveform_layout.addStretch()
++        layout.addLayout(waveform_layout)
++        
++        self.live_lbl = QLabel("● LIVE")
++        self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++        self.live_lbl.setAlignment(Qt.AlignCenter)
++        layout.addWidget(self.live_lbl)
++        
++        noise_title = QHBoxLayout()
++        noise_lbl = QLabel("NOISE FLOOR")
++        noise_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        self.noise_val = QLabel("0.0 RMS")
++        self.noise_val.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++        noise_title.addWidget(noise_lbl)
++        noise_title.addStretch()
++        noise_title.addWidget(self.noise_val)
++        layout.addLayout(noise_title)
++        
++        self.noise_bar = QProgressBar()
++        self.noise_bar.setRange(0, 100)
++        self.noise_bar.setValue(5)
++        self.noise_bar.setTextVisible(False)
++        self.noise_bar.setStyleSheet("""
++            QProgressBar {
++                background: rgba(255, 255, 255, 15);
++                border: 1px solid rgba(255, 0, 127, 50);
++                border-radius: 4px;
++                height: 6px;
++            }
++            QProgressBar::chunk {
++                background: #ff007f;
++                border-radius: 4px;
++            }
++        """)
++        layout.addWidget(self.noise_bar)
++        
++        boost_title = QHBoxLayout()
++        boost_lbl = QLabel("MIC BOOST")
++        boost_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        self.boost_val = QLabel("1.2x")
++        self.boost_val.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++        boost_title.addWidget(boost_lbl)
++        boost_title.addStretch()
++        boost_title.addWidget(self.boost_val)
++        layout.addLayout(boost_title)
++        
++        self.boost_bar = QProgressBar()
++        self.boost_bar.setRange(0, 100)
++        self.boost_bar.setValue(35)
++        self.boost_bar.setTextVisible(False)
++        self.boost_bar.setStyleSheet("""
++            QProgressBar {
++                background: rgba(255, 255, 255, 15);
++                border: 1px solid rgba(255, 0, 127, 50);
++                border-radius: 4px;
++                height: 6px;
++            }
++            QProgressBar::chunk {
++                background: #ff0055;
++                border-radius: 4px;
++            }
++        """)
++        layout.addWidget(self.boost_bar)
++        
++        self.wave_timer = QTimer(self)
++        self.wave_timer.timeout.connect(self.animate_waveform)
++        self.wave_timer.start(500)
++        
++    def animate_waveform(self):
++        state = self.visualizer.state
++        for bar in self.waveform_bars:
++            if state in ["listening", "speaking"]:
++                h = random.randint(5, 30)
++                bar.setFixedHeight(h)
++                bar.setStyleSheet("background: #ff007f; border-radius: 1px;")
++            else:
++                bar.setFixedHeight(8)
++                bar.setStyleSheet("background: rgba(255, 0, 127, 100); border-radius: 1px;")
++                
++    def set_state(self, state):
++        self.visualizer.state = state
++        if state == "listening":
++            self.live_lbl.setText("● LISTENING")
++            self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++        elif state == "speaking":
++            self.live_lbl.setText("● SPEAKING")
++            self.live_lbl.setStyleSheet("color: #00ffff; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++        elif state == "processing":
++            self.live_lbl.setText("● PROCESSING")
++            self.live_lbl.setStyleSheet("color: #ffff00; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
+         else:
+-            print("🔇 Microphone deactivated")
+-            # Add your original mic deactivation logic here
++            self.live_lbl.setText("● LIVE")
++            self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++
++class SystemStatusWidget(QWidget):
++    """Left side bottom panel for general system and latency status"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setFixedWidth(300)
++        self.init_ui()
+         
+-    def show_settings(self):
+-        """Show settings - YOUR ORIGINAL LOGIC"""
+-        print("⚙️ Opening Premium Settings...")
+-        # Add your original settings logic here
+-        
+-    def show_help(self):
+-        """Show help - YOUR ORIGINAL LOGIC"""
+-        print("❓ Opening Premium Help...")
+-        # Add your original help logic here
++    def init_ui(self):
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(15, 10, 15, 10)
++        layout.setSpacing(6)
++        
++        title = QLabel("SYSTEM STATUS")
++        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
++        layout.addWidget(title)
++        
++        line = QFrame()
++        line.setFrameShape(QFrame.HLine)
++        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
++        layout.addWidget(line)
++        
++        grid = QHBoxLayout()
++        self.last_latency_lbl = QLabel("LAST COMMAND\n0.00 SEC")
++        self.avg_latency_lbl = QLabel("AVERAGE\n0.00 SEC")
++        for lbl in [self.last_latency_lbl, self.avg_latency_lbl]:
++            lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
++            lbl.setAlignment(Qt.AlignCenter)
++            grid.addWidget(lbl)
+             
+-    def close_application(self):
+-        """Close application COMPLETELY"""
+-        print("🔄 Shutting down MJ AI...")
++        layout.addLayout(grid)
++
++class LiveSessionWidget(QWidget):
++    """Right-side chat history and command entry panel - STREAMING CAPABLE"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setFixedWidth(350)
++        self._active_bubble_label = None   # QLabel being streamed into
++        self._active_bubble_text = ""      # accumulated text so far
++        self._streaming = False
++        self._cursor_visible = True
++        self._cursor_timer = None
++        self._bubble_count = 0
++        self.MAX_BUBBLES = 50              # cap for 2-hour session stability
++        self.init_ui()
+         
+-        # Stop all animations
+-        if hasattr(self, 'float_anim'):
+-            self.float_anim.stop()
++    def init_ui(self):
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(15, 10, 15, 10)
++        layout.setSpacing(12)
++        
++        header = QHBoxLayout()
++        title = QLabel("TONY - LIVE SESSION")
++        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
++        header.addWidget(title)
++        header.addStretch()
++        
++        live_badge = QLabel("● LIVE")
++        live_badge.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
++        header.addWidget(live_badge)
++        layout.addLayout(header)
++        
++        line = QFrame()
++        line.setFrameShape(QFrame.HLine)
++        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
++        layout.addWidget(line)
++        
++        self.scroll_area = QScrollArea()
++        self.scroll_area.setWidgetResizable(True)
++        self.scroll_area.setStyleSheet("""
++            QScrollArea {
++                background: transparent;
++                border: none;
++            }
++            QScrollBar:vertical {
++                border: none;
++                background: rgba(255, 255, 255, 5);
++                width: 6px;
++                border-radius: 3px;
++            }
++            QScrollBar::handle:vertical {
++                background: rgba(255, 0, 127, 80);
++                border-radius: 3px;
++            }
++            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
++                border: none;
++                background: none;
++            }
++        """)
++        
++        self.scroll_widget = QWidget()
++        self.scroll_widget.setStyleSheet("background: transparent;")
++        self.chat_layout = QVBoxLayout(self.scroll_widget)
++        self.chat_layout.setContentsMargins(0, 5, 0, 5)
++        self.chat_layout.setSpacing(10)
++        self.chat_layout.addStretch()
++        
++        self.scroll_area.setWidget(self.scroll_widget)
++        layout.addWidget(self.scroll_area)
++        
++        input_container = QHBoxLayout()
++        input_container.setSpacing(8)
++        
++        self.input_field = QLineEdit()
++        self.input_field.setPlaceholderText("Kuch likhkar bhejo TONY ko...")
++        self.input_field.setStyleSheet("""
++            QLineEdit {
++                background: rgba(255, 0, 127, 10);
++                border: 1px solid rgba(255, 0, 127, 80);
++                border-radius: 15px;
++                color: #ffffff;
++                font-family: 'Segoe UI';
++                font-size: 12px;
++                padding: 6px 15px;
++            }
++            QLineEdit:focus {
++                border: 1px solid #ff007f;
++                background: rgba(255, 0, 127, 20);
++            }
++        """)
++        self.input_field.returnPressed.connect(self.send_text)
++        input_container.addWidget(self.input_field)
++        
++        self.send_btn = QPushButton("➤")
++        self.send_btn.setFixedSize(32, 32)
++        self.send_btn.setStyleSheet("""
++            QPushButton {
++                background: #ff007f;
++                border: none;
++                border-radius: 16px;
++                color: white;
++                font-size: 14px;
++                font-weight: bold;
++            }
++            QPushButton:hover {
++                background: #ff3399;
++            }
++            QPushButton:pressed {
++                background: #cc0066;
++            }
++        """)
++        self.send_btn.clicked.connect(self.send_text)
++        input_container.addWidget(self.send_btn)
++        
++        layout.addLayout(input_container)
++        
++        # Cursor blink timer
++        self._cursor_timer = QTimer(self)
++        self._cursor_timer.timeout.connect(self._blink_cursor)
++        
++        # Show initial greeting bubble
++        self.add_bubble("TONY", "Swagat hai Boss! Kuch bhi bolo, main sun raha hoon.")
++        
++    # ----------------------------------------------------------------
++    # STREAMING API — called via Qt signals from the agent thread
++    # ----------------------------------------------------------------
++    def start_stream_bubble(self, sender: str):
++        """Create a new streaming bubble. Called from agent via Qt signal."""
++        # Close any previous unclosed stream
++        if self._streaming:
++            self.end_stream()
++        self._streaming = True
++        self._active_bubble_text = ""
++        self._cursor_visible = True
++
++        bubble = QFrame()
++        bubble_layout = QVBoxLayout(bubble)
++        bubble_layout.setContentsMargins(12, 8, 12, 8)
++        bubble_layout.setSpacing(4)
++
++        sender_lbl = QLabel(sender)
++        if sender == "You":
++            sender_lbl.setStyleSheet("color: #ffb6c1; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++            bubble.setStyleSheet("""
++                QFrame {
++                    background: rgba(255, 0, 127, 30);
++                    border: 1px solid rgba(255, 0, 127, 120);
++                    border-radius: 10px;
++                    margin-left: 50px;
++                }
++            """)
++        else:
++            sender_lbl.setStyleSheet("color: #00ffff; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++            bubble.setStyleSheet("""
++                QFrame {
++                    background: rgba(255, 255, 255, 10);
++                    border: 1px solid rgba(255, 255, 255, 30);
++                    border-radius: 10px;
++                    margin-right: 50px;
++                }
++            """)
++        bubble_layout.addWidget(sender_lbl)
++
++        from datetime import datetime as _dt
++        time_lbl = QLabel(_dt.now().strftime("%H:%M"))
++        time_lbl.setStyleSheet("color: rgba(255,255,255,40); font-family: 'Segoe UI'; font-size: 8px; border: none; background: transparent;")
++        bubble_layout.addWidget(time_lbl)
++
++        text_lbl = QLabel("\u258c")  # blinking cursor placeholder
++        text_lbl.setWordWrap(True)
++        text_lbl.setMinimumHeight(20)
++        text_lbl.setStyleSheet("color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; border: none; background: transparent;")
++        bubble_layout.addWidget(text_lbl)
++        self._active_bubble_label = text_lbl
++
++        self._enforce_bubble_cap()
++        self.chat_layout.takeAt(self.chat_layout.count() - 1)
++        self.chat_layout.addWidget(bubble)
++        self.chat_layout.addStretch()
++        self._bubble_count += 1
++
++        self._cursor_timer.start(500)
++        self._auto_scroll()
++
++    def stream_chunk(self, chunk: str):
++        """Append text chunk to the active streaming bubble."""
++        if self._active_bubble_label is None:
++            return
++        self._active_bubble_text += chunk
++        self._active_bubble_label.setText(self._active_bubble_text + "\u258c")
++        self._auto_scroll()
++
++    def stream_replace(self, text: str):
++        """Replace (not append) the active streaming bubble text — used for live STT partial transcripts."""
++        if self._active_bubble_label is None:
++            return
++        self._active_bubble_text = text   # REPLACE, not append
++        self._active_bubble_label.setText(self._active_bubble_text + "\u258c")
++        self._auto_scroll()
++
++    def end_stream(self):
++        """Finalize the streaming bubble - remove cursor, lock text."""
++        self._cursor_timer.stop()
++        if self._active_bubble_label is not None:
++            self._active_bubble_label.setText(self._active_bubble_text)
++        self._active_bubble_label = None
++        self._active_bubble_text = ""
++        self._streaming = False
++        self._auto_scroll()
++
++    def _blink_cursor(self):
++        """Toggle blinking cursor character."""
++        if self._active_bubble_label is None:
++            self._cursor_timer.stop()
++            return
++        self._cursor_visible = not self._cursor_visible
++        cursor_char = "\u258c" if self._cursor_visible else " "
++        self._active_bubble_label.setText(self._active_bubble_text + cursor_char)
++
++    def _enforce_bubble_cap(self):
++        """Keep at most MAX_BUBBLES in memory for long sessions."""
++        while self._bubble_count >= self.MAX_BUBBLES:
++            removed = False
++            for i in range(self.chat_layout.count()):
++                item = self.chat_layout.itemAt(i)
++                if item and item.widget() and isinstance(item.widget(), QFrame):
++                    widget = item.widget()
++                    self.chat_layout.removeWidget(widget)
++                    widget.deleteLater()
++                    self._bubble_count -= 1
++                    removed = True
++                    break
++            if not removed:
++                break
++
++    def _auto_scroll(self):
++        """Scroll chat to bottom."""
++        QTimer.singleShot(30, lambda: self.scroll_area.verticalScrollBar().setValue(
++            self.scroll_area.verticalScrollBar().maximum()
++        ))
++
++    # ----------------------------------------------------------------
++    # STATIC BUBBLE (initial greeting / legacy fallback)
++    # ----------------------------------------------------------------
++    def add_bubble(self, sender, text):
++        bubble = QFrame()
++        bubble_layout = QVBoxLayout(bubble)
++        bubble_layout.setContentsMargins(12, 8, 12, 8)
++        bubble_layout.setSpacing(4)
++
++        sender_lbl = QLabel(sender)
++        if sender == "You":
++            sender_lbl.setStyleSheet("color: #ffb6c1; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++            bubble.setStyleSheet("""
++                QFrame {
++                    background: rgba(255, 0, 127, 30);
++                    border: 1px solid rgba(255, 0, 127, 120);
++                    border-radius: 10px;
++                    margin-left: 50px;
++                }
++            """)
++        else:
++            sender_lbl.setStyleSheet("color: #00ffff; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
++            bubble.setStyleSheet("""
++                QFrame {
++                    background: rgba(255, 255, 255, 10);
++                    border: 1px solid rgba(255, 255, 255, 30);
++                    border-radius: 10px;
++                    margin-right: 50px;
++                }
++            """)
++        bubble_layout.addWidget(sender_lbl)
++
++        from datetime import datetime as _dt
++        time_lbl = QLabel(_dt.now().strftime("%H:%M"))
++        time_lbl.setStyleSheet("color: rgba(255,255,255,40); font-family: 'Segoe UI'; font-size: 8px; border: none; background: transparent;")
++        bubble_layout.addWidget(time_lbl)
++
++        text_lbl = QLabel(text)
++        text_lbl.setWordWrap(True)
++        text_lbl.setStyleSheet("color: #ffffff; font-family: 'Segoe UI'; font-size: 11px; border: none; background: transparent;")
++        bubble_layout.addWidget(text_lbl)
++
++        self._enforce_bubble_cap()
++        self.chat_layout.takeAt(self.chat_layout.count() - 1)
++        self.chat_layout.addWidget(bubble)
++        self.chat_layout.addStretch()
++        self._bubble_count += 1
++        self._auto_scroll()
++
++    def send_text(self):
++        text = self.input_field.text().strip()
++        if text:
++            self.add_bubble("You", text)
++            self.input_field.clear()
++            from core import runtime_agent
++            runtime_agent.send_text_command(text)
++
++class CentralVisualizerCore(QWidget):
++    """The central pulsing TONY core visualizer widget"""
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self.setMinimumSize(400, 400)
++        self.pulse_phase = 0.0
++        self.state = "idle"
++        self.timer = QTimer(self)
++        self.timer.timeout.connect(self.update_anim)
++        self.timer.start(33)  # 30 FPS (was 60, saves CPU)
+         
+-        # Cleanup floating widget
+-        if hasattr(self, 'floating_widget'):
+-            self.floating_widget.cleanup_animations()
++    def set_state(self, state):
++        self.state = state.lower()
+         
+-        # Force quit the application
+-        QApplication.quit()
++    def update_anim(self):
++        self.pulse_phase += 0.05
++        self.update()
+         
+-    def _start_agent_background(self):
+-        def run_agent():
+-            try:
+-                # Use asyncio in background thread with PROPER isolation
+-                loop = asyncio.new_event_loop()
+-                asyncio.set_event_loop(loop)
+-                print("🟡 Starting MJ agent in background thread...")
+-                
+-                # IMPORTANT: Add delay to ensure main window is stable
+-                time.sleep(2)
+-                
+-                from livekit.agents.cli import run_app
+-                from livekit.agents import WorkerOptions
+-                print("🔧 Initializing LiveKit agent...")
+-                run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+-                
+-            except Exception as e:
+-                print(f"❌ Agent error: {e}")
+-                import traceback
+-                traceback.print_exc()
+-                    
+-        # Start agent with lower priority to not interfere with UI
+-        self.agent_thread = threading.Thread(target=run_agent, daemon=True)
+-        self.agent_thread.name = "MJ-Agent-Background"
+-        self.agent_thread.start()
+-        print(f"🔧 Agent thread started: {self.agent_thread.name}")
++    def paintEvent(self, event):
++        painter = QPainter(self)
++        painter.setRenderHint(QPainter.Antialiasing)
+         
+-    def mousePressEvent(self, event):
+-        """Allow window dragging"""
+-        if event.button() == Qt.LeftButton:
+-            self.drag_start = event.globalPos() - self.frameGeometry().topLeft()
+-            event.accept()
++        cx, cy = self.width() / 2, self.height() / 2
++        
++        # Figma Design: A smooth gradient orb
++        state = self.state
++        
++        # Calculate dynamic radius based on pulse
++        pulse_amp = 10.0 * math.sin(self.pulse_phase * 2)
++        base_radius = 120.0
++        
++        if "wake" in state:
++            c1, c2, c3 = QColor(0, 255, 127), QColor(0, 200, 255), QColor(0, 100, 255)
++            pulse_amp = 15.0
++        elif "listening" in state:
++            c1, c2, c3 = QColor(0, 255, 255), QColor(90, 100, 255), QColor(140, 50, 255)
++            pulse_amp = 10.0
++        elif "speaking" in state:
++            c1, c2, c3 = QColor(255, 100, 255), QColor(140, 50, 255), QColor(50, 50, 255)
++            pulse_amp = 20.0 * math.sin(self.pulse_phase * 3)
++        elif "processing" in state or "thinking" in state:
++            c1, c2, c3 = QColor(255, 200, 0), QColor(255, 100, 0), QColor(255, 0, 100)
++            pulse_amp = 5.0
++        elif "executing" in state:
++            c1, c2, c3 = QColor(255, 100, 0), QColor(255, 0, 100), QColor(140, 50, 255)
++            pulse_amp = 15.0
++        elif "error" in state:
++            c1, c2, c3 = QColor(255, 50, 50), QColor(200, 0, 0), QColor(100, 0, 0)
++            pulse_amp = 0.0
++        else:
++            # Default IDLE state (cool cyan/blue)
++            c1, c2, c3 = QColor(0, 255, 255), QColor(0, 150, 255), QColor(0, 50, 200)
++            pulse_amp = 4.0 * math.sin(self.pulse_phase)
+             
+-    def mouseMoveEvent(self, event):
+-        """Handle window dragging"""
+-        if event.buttons() == Qt.LeftButton and hasattr(self, 'drag_start'):
+-            self.move(event.globalPos() - self.drag_start)
+-            event.accept()
+-
+-    def contextMenuEvent(self, event):
+-        """Right-click context menu to close the application"""
+-        menu = QMenu(self)
++        radius = base_radius + pulse_amp
+         
+-        # Add close action
+-        close_action = menu.addAction("❌ Close MJ AI")
+-        close_action.triggered.connect(self.close_application)
++        # 1. Subtle Outer Glow (single loop for performance)
++        glow = QRadialGradient(cx, cy, radius * 1.8)
++        glow.setColorAt(0, QColor(c2.red(), c2.green(), c2.blue(), 60))
++        glow.setColorAt(1, QColor(0, 0, 0, 0))
++        painter.setBrush(QBrush(glow))
++        painter.setPen(Qt.NoPen)
++        painter.drawEllipse(QPointF(cx, cy), radius * 1.8, radius * 1.8)
+         
+-        # Show menu at cursor position
+-        menu.exec_(event.globalPos())
++        # 2. Main Gradient Orb
++        # Move the gradient center slightly to simulate 3D lighting (Figma style)
++        grad_cx = cx - radius * 0.2
++        grad_cy = cy - radius * 0.2
++        
++        orb_grad = QRadialGradient(grad_cx, grad_cy, radius * 1.2)
++        orb_grad.setColorAt(0, c1)    # Highlight
++        orb_grad.setColorAt(0.5, c2)  # Midtone
++        orb_grad.setColorAt(1, c3)    # Shadow
++        
++        painter.setBrush(QBrush(orb_grad))
++        painter.setPen(Qt.NoPen)
++        painter.drawEllipse(QPointF(cx, cy), radius, radius)
++        
++        # Fast, elegant, no CPU lag!
++        painter.end()
+ 
+-class PremiumFloatingWidget(QWidget):
++class ModernFloatingWindow(QMainWindow):
++    """ULTRA PREMIUM HUD window matching the cyberpunk visual style"""
++    
+     def __init__(self):
+         super().__init__()
+-        self.setFixedSize(120, 120)  # Larger for premium look
++        print("🎯 ModernFloatingWindow INITIALIZED")
++        self.setup_window()
++        self.init_ui()
+         
+-        # Animation state
+-        self.animation_group = None
+-        self.is_animating = False
+-        self.pulse_phase = 0.0
++        # Instantiate signal bridge
++        self.bridge = PyQtSignalBridge()
++        self.bridge.connection_changed.connect(self.set_connection_label)
++        self.bridge.status_changed.connect(self.set_status_label)
++        # Legacy signals — kept for backward compat (streaming now primary)
++        self.bridge.command_received.connect(lambda c: None)
++        self.bridge.response_received.connect(lambda r: None)
++        self.bridge.latency_changed.connect(self.set_latency_values)
++        self.bridge.livekit_status_changed.connect(self.update_livekit_status)
++        self.bridge.gemini_status_changed.connect(self.update_gemini_status)
++        self.bridge.mic_status_changed.connect(self.update_mic_status)
++        # Streaming chat signals
++        self.bridge.stream_start.connect(self.live_session.start_stream_bubble)
++        self.bridge.stream_chunk.connect(self.live_session.stream_chunk)
++        self.bridge.stream_end.connect(self.live_session.end_stream)
++        self.bridge.stream_replace.connect(self.live_session.stream_replace)
++        self.bridge.add_static_bubble.connect(self.live_session.add_bubble)
++        
++        self.agent_thread = None
++        self.setup_gui_bindings()
++        self._start_agent_background()
++
++    def update_livekit_status(self, text, style):
++        self.livekit_status_lbl.setText(text)
++        self.livekit_status_lbl.setStyleSheet(style)
+         
+-        # 🔥 CRITICAL FIX: Initialize buttons list FIRST
+-        self.buttons = []
+-        
+-        # UPDATED: Premium button positions for larger widget
+-        self.button_target_positions = [
+-            QPointF(50, -45),   # Top button
+-            QPointF(120, 50),   # Right button  
+-            QPointF(50, 120),   # Bottom button
+-        ]
+-        
+-        self.button_colors = [
+-            QColor(255, 182, 193, 230),  # Light Pink (mic button)
+-            QColor(255, 215, 0, 230),    # Gold (settings button)
+-            QColor(255, 105, 180, 230)   # Hot Pink (help button)
+-        ]
+-        self.button_icons = ["🎤", "⚙️", "❓"]
+-        self.button_tooltips = ["LOVELY Voice", "Premium Settings", "AI Help"]
+-        
+-        self.setup_buttons()
+-        
+-        # Pulse animation timer
+-        self.pulse_timer = QTimer()
+-        self.pulse_timer.timeout.connect(self.update_pulse)
+-        self.pulse_timer.start(50)
+-        
+-    def update_pulse(self):
+-        """Update pulse animation for premium effects"""
+-        self.pulse_phase += 0.1
+-        self.update()
++    def update_gemini_status(self, text, style):
++        self.gemini_status_lbl.setText(text)
++        self.gemini_status_lbl.setStyleSheet(style)
+         
+-    def setup_buttons(self):
+-        """Create and setup ULTRA PREMIUM option buttons"""
+-        for i in range(3):
+-            button = QPushButton(self.button_icons[i], self)
+-            button.setFixedSize(65, 65)  # Larger buttons
+-            button.setToolTip(self.button_tooltips[i])
+-            button.hide()
+-            
+-            # Add opacity effect for fade animations
+-            opacity_effect = QGraphicsOpacityEffect(button)
+-            opacity_effect.setOpacity(0.0)
+-            button.setGraphicsEffect(opacity_effect)
+-            
+-            # Center button initially (hidden)
+-            button.move(55, 55)
+-            
+-            # ULTRA PREMIUM STYLESHEET
+-            button.setStyleSheet(f"""
+-                QPushButton {{
+-                    background: qradialgradient(cx:0.4, cy:0.4, radius: 1.8,
+-                        stop:0 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 250),
+-                        stop:0.6 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 180),
+-                        stop:0.9 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 120),
+-                        stop:1.0 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 80));
+-                    border: 3px solid rgba(255, 255, 255, 200);
+-                    border-radius: 30px;
++    def update_mic_status(self, text, style):
++        self.mic_status_lbl.setText(text)
++        self.mic_status_lbl.setStyleSheet(style)
++        
++    def setup_window(self):
++        self.setWindowTitle("TONY — Assistant")
++        self.setMinimumSize(1000, 700)
++        self.resize(1280, 800)
++
++    def init_ui(self):
++        bg_widget = QWidget(self)
++        self.setCentralWidget(bg_widget)
++        bg_widget.setObjectName("bg_widget")
++        bg_widget.setStyleSheet("""
++            QWidget#bg_widget {
++                background-color: #000000;
++            }
++        """)
++        
++        main_layout = QVBoxLayout(bg_widget)
++        main_layout.setContentsMargins(0, 0, 0, 0)
++        main_layout.setSpacing(0)
++        
++        # Center container
++        center_container = QWidget()
++        center_container.setStyleSheet("background: transparent; border: none;")
++        center_layout = QVBoxLayout(center_container)
++        center_layout.setContentsMargins(0, 0, 0, 0)
++        center_layout.setSpacing(20)
++        
++        # Central pulsing orb
++        self.central_core = CentralVisualizerCore()
++        center_layout.addWidget(self.central_core, 0, Qt.AlignCenter)
++        
++        # Status Label (Figma Style)
++        self.status_title_lbl = QLabel("I'm listening, Boss...\nWhat's on your mind?")
++        self.status_title_lbl.setStyleSheet("color: #e0e0e0; font-family: 'Segoe UI'; font-size: 20px; font-weight: normal; border: none; background: transparent;")
++        self.status_title_lbl.setAlignment(Qt.AlignCenter)
++        center_layout.addWidget(self.status_title_lbl, 0, Qt.AlignCenter)
++        
++        # Add a couple of dummy buttons matching Figma's mic/cancel look
++        btn_layout = QHBoxLayout()
++        btn_layout.setSpacing(20)
++        btn_layout.setAlignment(Qt.AlignCenter)
++        
++        for icon in ["×", "🎤"]:
++            btn = QPushButton(icon)
++            btn.setFixedSize(50, 50)
++            btn.setStyleSheet("""
++                QPushButton {
++                    background-color: #1a1a2e;
+                     color: white;
+-                    font-size: 20px;
+-                    font-weight: bold;
+-                }}
+-                QPushButton:hover {{
+-                    background: qradialgradient(cx:0.4, cy:0.4, radius: 1.8,
+-                        stop:0 rgba(255, 255, 255, 250),
+-                        stop:0.6 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 220),
+-                        stop:1.0 rgba({self.button_colors[i].red()}, {self.button_colors[i].green()}, {self.button_colors[i].blue()}, 150));
+-                    border: 3px solid rgba(255, 255, 255, 255);
+-                }}
++                    border-radius: 25px;
++                    font-size: 18px;
++                    border: 1px solid #333344;
++                }
++                QPushButton:hover { background-color: #2a2a4e; }
+             """)
++            btn_layout.addWidget(btn)
+             
+-            self.buttons.append(button)
+-            
+-    def connect_buttons(self, main_window):
+-        """Connect buttons to main window functions"""
+-        for i, button in enumerate(self.buttons):
+-            if i == 0:  # Mic button
+-                button.clicked.connect(main_window.toggle_mic)
+-            elif i == 1:  # Settings button
+-                button.clicked.connect(main_window.show_settings)
+-            elif i == 2:  # Help button
+-                button.clicked.connect(main_window.show_help)
+-            
+-    def show_option_buttons(self):
+-        """Show buttons with ULTRA PREMIUM LOVELY animation"""
+-        try:
+-            if self.is_animating:
+-                return
+-                
+-            self.is_animating = True
+-            
+-            # Cancel any ongoing hide animations
+-            if self.animation_group and self.animation_group.state() == QPropertyAnimation.Running:
+-                self.animation_group.stop()
+-                self.animation_group.deleteLater()
+-                
+-            self.animation_group = QParallelAnimationGroup()
+-            
+-            for i, button in enumerate(self.buttons):
+-                button.show()
+-                button.raise_()
+-                
+-                # Start from center with small size
+-                button.setFixedSize(15, 15)
+-                button.move(52, 52)
+-                
+-                # Create parallel animation for each button
+-                button_group = QParallelAnimationGroup()
+-                
+-                # Position animation with premium easing
+-                pos_anim = QPropertyAnimation(button, b"pos")
+-                pos_anim.setDuration(600)
+-                pos_anim.setEasingCurve(QEasingCurve.OutBack)
+-                pos_anim.setStartValue(QPointF(52, 52))
+-                pos_anim.setEndValue(self.button_target_positions[i])
+-                
+-                # Scale animation with premium easing
+-                scale_anim = QPropertyAnimation(button, b"size")
+-                scale_anim.setDuration(600)
+-                scale_anim.setEasingCurve(QEasingCurve.OutBack)
+-                scale_anim.setStartValue(QSize(15, 15))
+-                scale_anim.setEndValue(QSize(65, 65))
+-                
+-                # Opacity fade-in animation
+-                opacity_effect = button.graphicsEffect()
+-                opacity_anim = QPropertyAnimation(opacity_effect, b"opacity")
+-                opacity_anim.setDuration(500)
+-                opacity_anim.setStartValue(0.0)
+-                opacity_anim.setEndValue(1.0)
+-                opacity_anim.setEasingCurve(QEasingCurve.OutCubic)
+-                
+-                button_group.addAnimation(pos_anim)
+-                button_group.addAnimation(scale_anim)
+-                button_group.addAnimation(opacity_anim)
+-                
+-                # Add LOVELY delay between each button
+-                delayed_group = QSequentialAnimationGroup()
+-                delayed_group.addPause(i * 150)  # 150ms delay for premium feel
+-                delayed_group.addAnimation(button_group)
+-                
+-                self.animation_group.addAnimation(delayed_group)
+-            
+-            self.animation_group.finished.connect(lambda: setattr(self, 'is_animating', False))
+-            self.animation_group.start()
+-
+-        except Exception as e:
+-            print(f"Premium animation error: {e}")
+-            self.is_animating = False
++        center_layout.addLayout(btn_layout)
+         
+-    def hide_option_buttons(self):
+-        """Hide buttons with smooth LOVELY collapse"""
+-        try:
+-            if self.is_animating:
+-                return
+-                
+-            self.is_animating = True
++        main_layout.addWidget(center_container, 0, Qt.AlignCenter)
++        
++        # Dummy objects to prevent crash from backend signals
++        class DummyLabel:
++            def setText(self, text): pass
++            def setStyleSheet(self, style): pass
+             
+-            # Cancel any ongoing show animations
+-            if self.animation_group and self.animation_group.state() == QPropertyAnimation.Running:
+-                self.animation_group.stop()
+-                self.animation_group.deleteLater()
++        class DummySysStatus:
++            def __init__(self):
++                self.last_latency_lbl = DummyLabel()
++                self.avg_latency_lbl = DummyLabel()
+                 
+-            self.animation_group = QParallelAnimationGroup()
++        class DummyVoiceEngine:
++            def set_state(self, state): pass
+             
+-            for i, button in enumerate(self.buttons):
+-                # Create parallel animation for each button
+-                button_group = QParallelAnimationGroup()
+-                
+-                # Scale down animation
+-                scale_anim = QPropertyAnimation(button, b"size")
+-                scale_anim.setDuration(400)
+-                scale_anim.setEasingCurve(QEasingCurve.InCubic)
+-                scale_anim.setStartValue(QSize(65, 65))
+-                scale_anim.setEndValue(QSize(15, 15))
+-                
+-                # Move back to center
+-                pos_anim = QPropertyAnimation(button, b"pos")
+-                pos_anim.setDuration(400)
+-                pos_anim.setEasingCurve(QEasingCurve.InCubic)
+-                pos_anim.setStartValue(self.button_target_positions[i])
+-                pos_anim.setEndValue(QPointF(52, 52))
+-                
+-                # Opacity fade-out animation
+-                opacity_effect = button.graphicsEffect()
+-                opacity_anim = QPropertyAnimation(opacity_effect, b"opacity")
+-                opacity_anim.setDuration(350)
+-                opacity_anim.setStartValue(1.0)
+-                opacity_anim.setEndValue(0.0)
+-                opacity_anim.setEasingCurve(QEasingCurve.InCubic)
+-                
+-                button_group.addAnimation(scale_anim)
+-                button_group.addAnimation(pos_anim)
+-                button_group.addAnimation(opacity_anim)
+-                
+-                # Hide button after animation completes
+-                button_group.finished.connect(button.hide)
+-                
+-                self.animation_group.addAnimation(button_group)
++        class DummyLiveSession:
++            def start_stream_bubble(self, sender): pass
++            def stream_chunk(self, chunk): pass
++            def end_stream(self): pass
++            def stream_replace(self, text): pass
++            def add_bubble(self, sender, text): pass
+             
+-            self.animation_group.finished.connect(lambda: setattr(self, 'is_animating', False))
+-            self.animation_group.start()
+-            
+-        except Exception as e:
+-            print(f"Premium hide animation error: {e}")
+-            self.is_animating = False
+-            # Force hide all buttons
+-            for button in self.buttons:
+-                button.hide()
+-            
+-    def paintEvent(self, event):
+-        """Paint the ULTRA PREMIUM LOVELY glassmorphism widget"""
+-        painter = QPainter(self)
+-        painter.setRenderHint(QPainter.Antialiasing)
+-        
+-        # Draw LOVELY glow effect
+-        self.draw_VADRYK_glow(painter)
+-        
+-        # Main circle with LOVELY glassmorphism
+-        self.draw_VADRYK_main_circle(painter)
+-        
+-        # Animated orbiting particles
+-        self.draw_orbiting_particles(painter)
++        self.livekit_status_lbl = DummyLabel()
++        self.gemini_status_lbl = DummyLabel()
++        self.mic_status_lbl = DummyLabel()
++        self.clock_lbl = DummyLabel()
++        self.sys_status = DummySysStatus()
++        self.voice_engine = DummyVoiceEngine()
++        self.live_session = DummyLiveSession()
++
++
++
++
++    def update_clock(self):
++        self.clock_lbl.setText(datetime.now().strftime("%H:%M:%S"))
++
++    def show_settings(self):
++        print("⚙️ Settings clicked")
+         
+-        # Center "M" icon with holographic effect
+-        self.draw_center_icon(painter)
++    def closeEvent(self, event):
++        print("🛑 Close event triggered - Shutting down...")
++        self.close_application()
++        event.accept()
+ 
+-    def draw_VADRYK_glow(self, painter):
+-        """Draw LOVELY glow effect behind main circle"""
+-        glow_path = QPainterPath()
+-        glow_path.addEllipse(2, 2, 116, 116)
++    def close_application(self):
++        print("🔄 Shutting down TONY AI...")
+         
+-        # Multi-layer LOVELY glow
+-        for i in range(3):
+-            radius = 58 - i * 5
+-            gradient = QRadialGradient(60, 60, radius)
+-            
+-            if i == 0:
+-                gradient.setColorAt(0, QColor(255, 182, 193, 120))  # Light Pink
+-                gradient.setColorAt(0.7, QColor(255, 140, 160, 80))  # Medium Pink
+-                gradient.setColorAt(1, QColor(255, 105, 180, 0))    # Hot Pink
+-            elif i == 1:
+-                gradient.setColorAt(0, QColor(255, 215, 0, 60))     # Gold
+-                gradient.setColorAt(0.5, QColor(255, 182, 193, 40)) # Light Pink
+-                gradient.setColorAt(1, QColor(255, 192, 203, 0))    # Pink
+-            else:
+-                pulse_alpha = 30 + 20 * math.sin(self.pulse_phase)
+-                gradient.setColorAt(0, QColor(255, 255, 255, int(pulse_alpha)))
+-                gradient.setColorAt(1, QColor(255, 255, 255, 0))
+-            
+-            painter.fillPath(glow_path, QBrush(gradient))
+-
+-    def draw_VADRYK_main_circle(self, painter):
+-        """Draw main circle with LOVELY glassmorphism"""
+-        main_path = QPainterPath()
+-        main_path.addEllipse(10, 10, 100, 100)
+-        
+-        # LOVELY glassmorphism gradient
+-        gradient = QRadialGradient(60, 60, 50)
+-        gradient.setColorAt(0, QColor(255, 255, 255, 180))
+-        gradient.setColorAt(0.2, QColor(255, 240, 245, 120))   # Very Light Pink
+-        gradient.setColorAt(0.4, QColor(255, 228, 225, 80))    # Misty Rose
+-        gradient.setColorAt(0.7, QColor(255, 192, 203, 50))    # Pink
+-        gradient.setColorAt(1, QColor(255, 182, 193, 30))
+-        
+-        painter.fillPath(main_path, QBrush(gradient))
+-        
+-        # LOVELY border with animated pulse
+-        pulse_width = 3 + math.sin(self.pulse_phase) * 1
+-        pen = QPen(QColor(255, 255, 255, 200))
+-        pen.setWidth(int(pulse_width))
+-        painter.setPen(pen)
+-        painter.drawPath(main_path)
+-        
+-        # Inner LOVELY rings
+-        for i in range(2):
+-            ring_path = QPainterPath()
+-            ring_radius = 35 - i * 10
+-            ring_path.addEllipse(60 - ring_radius, 60 - ring_radius, 
+-                               ring_radius * 2, ring_radius * 2)
+-            
+-            alpha = 80 - i * 30
+-            pen = QPen(QColor(255, 218, 233, int(alpha)))  # Pink tint
+-            pen.setWidth(1)
+-            painter.setPen(pen)
+-            painter.drawPath(ring_path)
+-
+-    def draw_orbiting_particles(self, painter):
+-        """Draw animated orbiting particles"""
+-        for i in range(8):
+-            angle = (self.pulse_phase + i * math.pi/4) % (2 * math.pi)
+-            radius = 45
+-            x = 60 + radius * math.cos(angle)
+-            y = 60 + radius * math.sin(angle)
+-            
+-            particle_size = 2 + math.sin(self.pulse_phase * 2 + i) * 1.5
+-            alpha = 150 + int(50 * math.sin(self.pulse_phase * 3 + i))
+-            
+-            # Line 440-460 ke aas-pass:
+-            color = QColor(255, 182, 193, int(alpha))  # Light Pink
+-            if i % 3 == 0:
+-                color = QColor(255, 215, 0, int(alpha))    # Gold
+-            elif i % 2 == 0:
+-                color = QColor(255, 255, 255, int(alpha))  # White
++        # Shut down LiveKit agent loop safely
++        if hasattr(self, "_agent_loop") and hasattr(self, "_agent_server"):
++            print("🛑 Stopping LiveKit Agent Server...")
++            import asyncio
++            try:
++                # Schedule stop asynchronously in the worker loop
++                async def shutdown():
++                    await self._agent_server.aclose()
++                    self._agent_loop.stop()
++                asyncio.run_coroutine_threadsafe(shutdown(), self._agent_loop)
+                 
+-            painter.setBrush(QBrush(color))
+-            painter.setPen(Qt.NoPen)
+-            painter.drawEllipse(QPointF(x, y), particle_size, particle_size)
+-
+-    def draw_center_icon(self, painter):
+-        """Draw premium center icon with holographic effect"""
+-        # Background glow for icon
+-        icon_glow = QRadialGradient(60, 60, 25)
+-        icon_glow.setColorAt(0, QColor(255, 182, 193, 100))  # Light Pink
+-        icon_glow.setColorAt(1, QColor(255, 182, 193, 0))
+-        painter.setBrush(QBrush(icon_glow))
+-        painter.setPen(Qt.NoPen)
+-        painter.drawEllipse(35, 35, 50, 50)
+-        
+-        # Main "M" icon with premium gradient
+-        painter.setPen(QPen(QColor(255, 255, 255, 255)))
+-        premium_font = QFont("Segoe UI", 28, QFont.Black)
+-        painter.setFont(premium_font)
+-        
+-        # Icon glow effect
+-        for i in range(5, 0, -1):
+-            alpha = 60 - i * 10
+-            glow_color = QColor(255, 215, 0, int(alpha))  # Gold
+-            painter.setPen(QPen(glow_color, i))
+-            painter.drawText(self.rect(), Qt.AlignCenter, "M")
+-        
+-        # Main icon
+-        icon_gradient = QLinearGradient(45, 45, 75, 75)
+-        icon_gradient.setColorAt(0, QColor(255, 255, 255))      # White
+-        icon_gradient.setColorAt(0.5, QColor(255, 240, 245))    # Very Light Pink
+-        icon_gradient.setColorAt(1, QColor(255, 215, 0))
+-        
+-        painter.setPen(QPen(QBrush(icon_gradient), 3))
+-        painter.drawText(self.rect(), Qt.AlignCenter, "M")
+-
+-    def cleanup_animations(self):
+-        """Safely cleanup all premium animations"""
+-        self.is_animating = False
++                # Wait for thread to finish cleanly (max 2 seconds)
++                if hasattr(self, "agent_thread") and self.agent_thread.is_alive():
++                    self.agent_thread.join(timeout=2.0)
++            except Exception as e:
++                print(f"⚠️ Error shutting down server: {e}")
++                
++        QApplication.quit()
++    def set_latency_values(self, last_sec, avg_sec):
++        self.sys_status.last_latency_lbl.setText(f"LAST COMMAND\n{last_sec:.2f} SEC")
++        self.sys_status.avg_latency_lbl.setText(f"AVERAGE\n{avg_sec:.2f} SEC")
+         
+-        if hasattr(self, 'pulse_timer') and self.pulse_timer.isActive():
+-            self.pulse_timer.stop()
++    def setup_gui_bindings(self):
++        from core import runtime_agent
++        from PyQt5.sip import isdeleted
+         
+-        if hasattr(self, 'animation_group') and self.animation_group:
++        def safe_emit(signal, *args):
+             try:
+-                if self.animation_group.state() == QPropertyAnimation.Running:
+-                    self.animation_group.stop()
+-                self.animation_group.deleteLater()
+-            except:
++                if not isdeleted(self) and not isdeleted(self.bridge):
++                    signal.emit(*args)
++            except RuntimeError:
+                 pass
+-            finally:
+-                self.animation_group = None
++                
++        runtime_agent.register_gui_callbacks(
++            update_status=lambda s: safe_emit(self.bridge.status_changed, s),
++            update_command=lambda c: safe_emit(self.bridge.command_received, c),
++            update_response=lambda r: safe_emit(self.bridge.response_received, r),
++            update_connection=lambda conn: safe_emit(self.bridge.connection_changed, conn),
++            update_latency=lambda last, avg: safe_emit(self.bridge.latency_changed, last, avg),
++            update_mic_status=lambda mic_text: safe_emit(
++                self.bridge.mic_status_changed,
++                mic_text,
++                "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;"
++            ),
++            # Streaming callbacks — routed through Qt signals for thread safety
++            stream_start=lambda sender: safe_emit(self.bridge.stream_start, sender),
++            stream_chunk=lambda chunk: safe_emit(self.bridge.stream_chunk, chunk),
++            stream_end=lambda: safe_emit(self.bridge.stream_end),
++            # Partial transcript (replace, not append)
++            stream_replace=lambda text: safe_emit(self.bridge.stream_replace, text),
++            # History loading
++            add_static_bubble=lambda sender, text: safe_emit(self.bridge.add_static_bubble, sender, text),
++        )
+         
+-        # Hide all buttons immediately
+-        for button in self.buttons:
+-            button.hide()
++    def set_connection_label(self, text):
++        text_lower = text.lower()
++        
++        # Parse LiveKit
++        if "livekit: online" in text_lower or "livekit: connected" in text_lower or "connected" in text_lower:
++            self.livekit_status_lbl.setText("LIVEKIT: ONLINE")
++            self.livekit_status_lbl.setStyleSheet("color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        elif "livekit: connecting" in text_lower or "connecting" in text_lower:
++            self.livekit_status_lbl.setText("LIVEKIT: CONNECTING")
++            self.livekit_status_lbl.setStyleSheet("color: #ffff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        elif "livekit: reconnecting" in text_lower or "reconnecting" in text_lower:
++            self.livekit_status_lbl.setText("LIVEKIT: RECONNECTING")
++            self.livekit_status_lbl.setStyleSheet("color: #ffaa00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        else:
++            self.livekit_status_lbl.setText("LIVEKIT: OFFLINE")
++            self.livekit_status_lbl.setStyleSheet("color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++            
++        # Parse Gemini
++        if "gemini: online" in text_lower or "gemini: active" in text_lower or "active" in text_lower:
++            self.gemini_status_lbl.setText("GEMINI: ONLINE")
++            self.gemini_status_lbl.setStyleSheet("color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        elif "gemini: connecting" in text_lower:
++            self.gemini_status_lbl.setText("GEMINI: CONNECTING")
++            self.gemini_status_lbl.setStyleSheet("color: #ffff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        else:
++            self.gemini_status_lbl.setText("GEMINI: OFFLINE")
++            self.gemini_status_lbl.setStyleSheet("color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++        
++    def set_status_label(self, text):
++        text_lower = text.lower()
++        
++        # Figma Style Multi-line text mapping
++        if "listening" in text_lower or "speech" in text_lower or "transcrib" in text_lower:
++            self.status_title_lbl.setText("I'm listening, Boss...\nWhat's on your mind?")
++            col = "#e0e0e0"
++        elif "thinking" in text_lower or "processing" in text_lower or "executing" in text_lower:
++            self.status_title_lbl.setText("Thinking...\nProcessing your request")
++            col = "#aaaaaa"
++        elif "speaking" in text_lower:
++            self.status_title_lbl.setText("Speaking...\nHere's what I found")
++            col = "#ffffff"
++        elif "idle" in text_lower or "ready" in text_lower:
++            self.status_title_lbl.setText("Ready...\nWaiting for your command")
++            col = "#a0a0a0"
++        elif "error" in text_lower or "offline" in text_lower:
++            self.status_title_lbl.setText("Offline...\nReconnecting to systems")
++            col = "#ff5555"
++        else:
++            self.status_title_lbl.setText(f"{text.title()}...\nPlease wait")
++            col = "#cccccc"
+ 
+-# ... (rest of your existing code remains exactly the same - firebase, activation, etc.)
++        self.voice_engine.set_state(text.lower())
++        self.central_core.set_state(text.lower())
+ 
++        self.status_title_lbl.setStyleSheet(
++            f"color: {col}; font-family: 'Segoe UI'; font-size: 20px; font-weight: normal; border: none; background: transparent;"
++        )
++
++    def _start_agent_background(self):
++        def run_agent():
++            try:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
++                print("🟡 Starting TONY agent in background thread...")
++                
++                # Emit initial statuses
++                self.bridge.livekit_status_changed.emit("LIVEKIT: CONNECTING", "color: #ffff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                self.bridge.gemini_status_changed.emit("GEMINI: CONNECTING", "color: #ffff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                self.bridge.mic_status_changed.emit("MIC: CONNECTING", "color: #ffff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                self.bridge.status_changed.emit("connecting")
++                
++                async def handshake():
++                    import os
++                    from pathlib import Path
++                    from dotenv import load_dotenv
++                    
++                    # 1. LOAD ENV
++                    print("[BOOT] Loading environment...")
++                    dir_path = Path(__file__).resolve().parent
++                    env_path = dir_path / ".env"
++                    load_dotenv(dotenv_path=env_path)
++                    
++                    lk_url = os.getenv("LIVEKIT_URL")
++                    lk_key = os.getenv("LIVEKIT_API_KEY")
++                    lk_secret = os.getenv("LIVEKIT_API_SECRET")
++                    google_key = os.getenv("GOOGLE_API_KEY")
++                    
++                    print("[ENV] Checking credentials:")
++                    print("LIVEKIT_URL:", "PRESENT" if lk_url else "MISSING")
++                    print("LIVEKIT_API_KEY:", "PRESENT" if lk_key else "MISSING")
++                    print("LIVEKIT_API_SECRET:", "PRESENT" if lk_secret else "MISSING")
++                    print("GOOGLE_API_KEY:", "PRESENT" if google_key else "MISSING")
++                    
++                    livekit_ok = False
++                    gemini_ok = False
++                    mic_ok = False
++                    
++                    # 2. CONNECT LIVEKIT (Client)
++                    if not lk_url or not lk_key or not lk_secret:
++                        print("[LIVEKIT ERROR] Missing LiveKit credentials in .env")
++                        self.bridge.livekit_status_changed.emit("LIVEKIT: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                    else:
++                        print("[LIVEKIT] Connecting...")
++                        try:
++                            from livekit import rtc, api
++                            import time
++                            client_id = f"tony-desktop-client-{int(time.time())}"
++                            room_name = f"tony-voice-room-{int(time.time())}"
++                            token = api.AccessToken(lk_key, lk_secret)\
++                                .with_identity(client_id)\
++                                .with_grants(api.VideoGrants(room_join=True, room=room_name))\
++                                .to_jwt()
++                            self.client_room = rtc.Room()
++                            
++                            self.devices = rtc.MediaDevices()
++                            self.player = self.devices.open_output()
++                            await self.player.start()
++                            
++                            @self.client_room.on("track_subscribed")
++                            def on_track_subscribed(track: rtc.Track, publication, participant):
++                                if track.kind == rtc.TrackKind.KIND_AUDIO:
++                                    print(f"[AUDIO] Subscribed to agent audio track: {track.sid}")
++                                    asyncio.create_task(self.player.add_track(track))
++                            
++                            @self.client_room.on("data_received")
++                            def on_data_received(dp: rtc.DataPacket):
++                                if dp.topic == "tony_gui_rpc":
++                                    try:
++                                        import json
++                                        payload = json.loads(dp.data.decode("utf-8"))
++                                        cb_name = payload.get("callback")
++                                        args = payload.get("args", [])
++                                        if cb_name == 'update_status':
++                                            self.bridge.status_changed.emit(*args)
++                                        elif cb_name == 'update_command':
++                                            self.bridge.command_received.emit(*args)
++                                        elif cb_name == 'update_response':
++                                            self.bridge.response_received.emit(*args)
++                                        elif cb_name == 'update_connection':
++                                            self.bridge.connection_changed.emit(*args)
++                                        elif cb_name == 'update_latency':
++                                            self.bridge.latency_changed.emit(*args)
++                                        elif cb_name == 'update_mic_status':
++                                            self.bridge.mic_status_changed.emit(
++                                                args[0],
++                                                "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;"
++                                            )
++                                        elif cb_name == 'stream_start':
++                                            self.bridge.stream_start.emit(*args)
++                                        elif cb_name == 'stream_chunk':
++                                            self.bridge.stream_chunk.emit(*args)
++                                        elif cb_name == 'stream_end':
++                                            self.bridge.stream_end.emit()
++                                        elif cb_name == 'stream_replace':
++                                            self.bridge.stream_replace.emit(*args)
++                                        elif cb_name == 'add_static_bubble':
++                                            self.bridge.add_static_bubble.emit(*args)
++                                    except Exception as e:
++                                        print(f"⚠️ Error handling GUI RPC: {e}")
++                                    
++                            await self.client_room.connect(lk_url, token)
++                            print("[LIVEKIT] Connected")
++                            print(f"[LIVEKIT] Room: {room_name}")
++                            self.bridge.livekit_status_changed.emit("LIVEKIT: ONLINE | STT: READY", "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                            livekit_ok = True
++                        except Exception as e:
++                            print(f"[LIVEKIT ERROR] {e}")
++                            self.bridge.livekit_status_changed.emit("LIVEKIT: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++
++                    # 3. INITIALIZE GEMINI
++                    if not google_key:
++                        print("[GEMINI ERROR] GOOGLE_API_KEY is missing.")
++                        self.bridge.gemini_status_changed.emit("GEMINI: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                    else:
++                        print("[GEMINI] Initializing...")
++                        try:
++                            # The LiveKit Google plugin reads GOOGLE_API_KEY directly.
++                            # Avoid setting a second alias that can make credential
++                            # selection ambiguous.
++                            os.environ["GOOGLE_API_KEY"] = google_key
++                            from core.runtime_agent import _init_global_llm
++                            llm = _init_global_llm()
++                            if not llm:
++                                raise ValueError("Gemini Realtime LLM initialization failed")
++                            print("[GEMINI] Model initialized")
++                            print("[GEMINI] Realtime session ready")
++                            print("[GEMINI] ONLINE")
++                            self.bridge.gemini_status_changed.emit("GEMINI: ONLINE | TTS: READY", "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                            gemini_ok = True
++                        except Exception as e:
++                            print(f"[GEMINI ERROR] {e}")
++                            self.bridge.gemini_status_changed.emit("GEMINI: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++
++                    # 4. INITIALIZE MICROPHONE
++                    print("[MIC] Enumerating devices...")
++                    try:
++                        if not hasattr(self, "devices"):
++                            from livekit import rtc
++                            self.devices = rtc.MediaDevices()
++                            
++                        inputs = self.devices.list_input_devices()
++                        if not inputs:
++                            raise ValueError("No input devices found")
++                        
++                        default_in = self.devices.default_input_device()
++                        selected_idx = None
++                        selected_name = None
++                        
++                        if default_in:
++                            selected_idx = default_in['index']
++                            selected_name = default_in['name']
++                        else:
++                            # If default is None, find the first device with "microphone" or "mic" in its name
++                            for inp in inputs:
++                                name_lower = inp.get('name', '').lower()
++                                if "microphone" in name_lower or "mic" in name_lower:
++                                    # Prefer HostAPI 2 (WASAPI) or 1 (DirectSound)
++                                    if inp.get('hostapi') in [2, 1]:
++                                        selected_idx = inp['index']
++                                        selected_name = inp['name']
++                                        break
++                            
++                            # Fallback if no preferred HostAPI microphone found
++                            if selected_idx is None:
++                                for inp in inputs:
++                                    name_lower = inp.get('name', '').lower()
++                                    if "microphone" in name_lower or "mic" in name_lower:
++                                        selected_idx = inp['index']
++                                        selected_name = inp['name']
++                                        break
++                                        
++                            # Absolute fallback
++                            if selected_idx is None:
++                                selected_idx = inputs[0]['index']
++                                selected_name = inputs[0]['name']
++
++                        print(f"[MIC] Selected device: {selected_name}")
++                        print(f"[MIC] Device index: {selected_idx}")
++                        print("[MIC] Sample rate: 16000")
++                        
++                        self.mic = self.devices.open_input(input_device=selected_idx, enable_aec=True, noise_suppression=True)
++                        print("[MIC] READY")
++                        print("[AUDIO] input stream opened")
++                        self.bridge.mic_status_changed.emit("MIC: ONLINE", "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++                        mic_ok = True
++                        
++                        if livekit_ok:
++                            from livekit import rtc
++                            self.mic_track = rtc.LocalAudioTrack.create_audio_track("microphone", self.mic.source)
++                            print("[LIVEKIT AUDIO] microphone track created")
++                            pub_opts = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
++                            await self.client_room.local_participant.publish_track(self.mic_track, pub_opts)
++                            print("[LIVEKIT AUDIO] microphone track published")
++                    except Exception as e:
++                        print(f"[MIC ERROR] {e}")
++                        self.bridge.mic_status_changed.emit("MIC: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
++
++                    if livekit_ok and gemini_ok and mic_ok:
++                        print("[SESSION] Starting agent session...")
++                        print("[VOICE] VOICE PIPELINE READY")
++                        self.bridge.status_changed.emit("listening")
++                        return True
++                    else:
++                        errors = []
++                        if not livekit_ok: errors.append("LIVEKIT")
++                        if not gemini_ok: errors.append("GEMINI")
++                        if not mic_ok: errors.append("MIC")
++                        raise ValueError(f"Failed components: {', '.join(errors)}")
++                
++                try:
++                    loop.run_until_complete(handshake())
++                    handshake_success = True
++                except Exception as ex:
++                    print(f"❌ Handshake startup error: {ex}")
++                    import traceback
++                    traceback.print_exc()
++                    err_msg = str(ex).split('\n')[0].upper()
++                    self.bridge.status_changed.emit(f"offline (error: {err_msg})")
++                    handshake_success = False
++                
++                # Start worker regardless of handshake result
++                # LiveKit will retry connections internally
++                import sys
++                print("🟢 Starting TONY worker...")
++                async def start_worker():
++                    try:
++                        from livekit.agents.worker import AgentServer
++                        from livekit.agents import WorkerOptions, JobExecutorType
++                        opts = WorkerOptions(entrypoint_fnc=entrypoint, job_executor_type=JobExecutorType.THREAD)
++                        server = AgentServer.from_server_options(opts)
++                        self._agent_server = server
++                        self._agent_loop = loop
++                        await server.run(devmode=True)
++                    except Exception as w_err:
++                        print(f"❌ Failed to start integrated worker: {w_err}")
++                loop.create_task(start_worker())
++                loop.run_forever()
++            except Exception as e:
++                print(f"❌ Background agent error: {e}")
++                
++        self.agent_thread = threading.Thread(target=run_agent, name="TonyBackgroundLoop")
++        self.agent_thread.start()
+ 
+ 
+ 
+@@ -894,7 +1645,7 @@ def init_firebase_from_embedded(database_url=None):
+     
+     cred = credentials.Certificate(path)
+     firebase_admin.initialize_app(cred, {
+-        'databaseURL': database_url or 'https://mj-nova-default-rtdb.firebaseio.com/'
++        'databaseURL': database_url or 'https://Tony-Tony-default-rtdb.firebaseio.com/'
+     })
+ 
+ 
+@@ -923,7 +1674,7 @@ def prompt_user_name():
+     while True:
+         name, ok = QInputDialog.getText(
+             None,
+-            "User Setup - NOVA AI",
++            "User Setup - Tony AI",
+             "Enter your name (for personalized greeting):"
+         )
+         if not ok:
+@@ -944,7 +1695,7 @@ def prompt_lan():
+     while True:
+         name, ok = QInputDialog.getText(
+             None,
+-            "Language Setup - NOVA AI", 
++            "Language Setup - Tony AI", 
+             "Enter the language you want to use:"
+         )
+         if not ok:
+@@ -1014,7 +1765,7 @@ UPGRADE_PATHS = {
+ 
+ def detect_variant_and_ref(access_key):
+     for variant in ["base", "premium", "elite"]:
+-        ref = db.reference(f"nova{variant}/{access_key}")
++        ref = db.reference(f"Tony{variant}/{access_key}")
+         record = ref.get()
+         if record is not None:
+             return variant, ref, record
+@@ -1098,13 +1849,13 @@ def process_upgrade(current_variant):
+     set_env_variable("ACCESS_KEY", upgrade_key)
+     set_env_variable("IS_ACTIVATED", "true")
+     set_env_variable("ACTIVATION_COUNT", "1")
+-    set_env_variable("NOVA_VARIANT", next_variant)
++    set_env_variable("TONY_VARIANT", next_variant)
+     set_env_variable("SYSTEM_CONST_32", VARIANT_SECRET_MAP[next_variant])
+     
+     os.environ["ACCESS_KEY"] = upgrade_key
+     os.environ["IS_ACTIVATED"] = "true"
+     os.environ["ACTIVATION_COUNT"] = "1"
+-    os.environ["NOVA_VARIANT"] = next_variant
++    os.environ["TONY_VARIANT"] = next_variant
+     os.environ["SYSTEM_CONST_32"] = VARIANT_SECRET_MAP[next_variant]
+     
+     QMessageBox.information(
+@@ -1119,7 +1870,7 @@ def process_upgrade(current_variant):
+ def activation_gate():
+     access_key = os.getenv("ACCESS_KEY")
+     is_activated = os.getenv("IS_ACTIVATED", "").strip().lower() == "true"
+-    current_variant = os.getenv("NOVA_VARIANT", "")
++    current_variant = os.getenv("TONY_VARIANT", "")
+     
+     try:
+         activation_count = int(os.getenv("ACTIVATION_COUNT", "0").strip() or "0")
+@@ -1173,13 +1924,13 @@ def activation_gate():
+     set_env_variable("ACCESS_KEY", access_key)
+     set_env_variable("IS_ACTIVATED", "true")
+     set_env_variable("ACTIVATION_COUNT", "1")
+-    set_env_variable("NOVA_VARIANT", variant)
++    set_env_variable("TONY_VARIANT", variant)
+     set_env_variable("SYSTEM_CONST_32", VARIANT_SECRET_MAP[variant])
+ 
+     os.environ["ACCESS_KEY"] = access_key
+     os.environ["IS_ACTIVATED"] = "true"
+     os.environ["ACTIVATION_COUNT"] = "1"
+-    os.environ["NOVA_VARIANT"] = variant
++    os.environ["TONY_VARIANT"] = variant
+     os.environ["SYSTEM_CONST_32"] = VARIANT_SECRET_MAP[variant]
+ 
+     return True
+@@ -1204,13 +1955,13 @@ def safe_activation_gate():
+ class WaitForInternetDialog(QDialog):
+     def __init__(self, parent=None):
+         super().__init__(parent)
+-        self.setWindowTitle("MJ - Waiting for Internet")
++        self.setWindowTitle("TONY - Waiting for Internet")
+         self.setFixedSize(400, 150)
+         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+         
+         layout = QVBoxLayout()
+         
+-        self.message_label = QLabel("🔍 Checking internet connection...\nNOVA requires internet to start")
++        self.message_label = QLabel("🔍 Checking internet connection...\nTONY requires internet to start")
+         self.message_label.setAlignment(Qt.AlignCenter)
+         self.message_label.setWordWrap(True)
+         layout.addWidget(self.message_label)
+@@ -1241,7 +1992,7 @@ class WaitForInternetDialog(QDialog):
+     def check_internet(self):
+         """Check if internet is available"""
+         if self.is_internet_available():
+-            self.message_label.setText("✅ Internet connected!\nStarting MJ...")
++            self.message_label.setText("✅ Internet connected!\nStarting TONY...")
+             self.progress_bar.setRange(0, 1)
+             self.progress_bar.setValue(1)
+             QTimer.singleShot(1000, self.accept)  # Close after 1 second
+@@ -1286,9 +2037,9 @@ def wait_for_internet():
+ 
+ 
+ 
+-def start_nova_interface(app):
+-    """Start the MJ AI interface - FIXED VERSION"""
+-    print("🚀 Starting MJ AI Interface...")
++def start_tony_interface(app):
++    """Start the TONY AI interface - FIXED VERSION"""
++    print("🚀 Starting TONY AI Interface...")
+     
+     # Show full screen scanning animation first
+     scanning_window = ScanningAnimation()
+@@ -1307,7 +2058,7 @@ def start_nova_interface(app):
+         main_window.activateWindow()
+         main_window.setFocus()
+         
+-        print("✅ MJ AI Interface Started Successfully")
++        print("✅ TONY AI Interface Started Successfully")
+         print("📍 Floating window should be visible at the top center of your screen")
+         print("💡 Hover your mouse over the circular 'M' button to see options!")
+         print("🖱️ You can drag the window by clicking and dragging the main circle")
+@@ -1326,50 +2077,26 @@ def main():
+     try:
+         # Initialize QApplication
+         app = QApplication(sys.argv)
+-        app.setApplicationName("MJ AI")
++        app.setApplicationName("TONY AI")
+         app.setApplicationVersion("4.0")
+         
+-        # Prevent app from quitting when last window closes
++        # Prevent app from quitting when last window closes (Set to True to quit properly on exit)
+         app.setQuitOnLastWindowClosed(False)
+         
+-        print("🚀 STARTING MJ AI - PREMIUM EDITION")
+-        
+-        # STEP 1: Show welcome message
+-        QMessageBox.information(None, "MJ AI PREMIUM", 
+-                               "🚀 MJ AI LOVELY EDITION Starting...\n\n"
+-                               "Experience the future of AI assistance!\n"
+-                               "Make sure you are connected to the Internet!")
++        print("🚀 STARTING TONY AI - PREMIUM EDITION")
+         
+-        # STEP 2: Wait for internet connection FIRST
+-        print("🔍 Checking internet connection...")
+-        if not wait_for_internet():
+-            QMessageBox.critical(None, "Error", "Internet connection required. Exiting.")
+-            return 1
++        # Bypass Firebase & Activation Gate - Run in Elite mode locally
++        os.environ["ACCESS_KEY"] = "LOCAL_DEV_KEY"
++        os.environ["IS_ACTIVATED"] = "true"
++        os.environ["ACTIVATION_COUNT"] = "1"
++        os.environ["TONY_VARIANT"] = "elite"
++        os.environ["SYSTEM_CONST_32"] = VARIANT_SECRET_MAP["elite"]
++        os.environ["USER_NAME"] = "BOSS"
++        os.environ["LAN"] = "English"
+         
+-        # STEP 3: Initialize Firebase and verify activation
+-        print("🔑 Initializing Firebase and verifying activation...")
+-        try:
+-            init_firebase_from_embedded()
+-        except Exception as e:
+-            QMessageBox.critical(None, "Firebase Error", f"Failed to initialize Firebase: {e}")
+-            return 1
+-        
+-        # STEP 4: Run activation gate - THIS MUST COMPLETE BEFORE UI
+-        print("🔐 Running activation verification...")
+-        activation_success, status = safe_activation_gate()
+-        
+-        if not activation_success:
+-            if status == "failed":
+-                QMessageBox.critical(None, "Activation Failed", "Activation verification failed. Exiting.")
+-                return 1
+-            elif status == "fallback":
+-                # Continue in fallback mode
+-                QMessageBox.warning(None, "Fallback Mode", 
+-                                   "Running in limited fallback mode.\nSome features may not work.")
+-        
+-        # STEP 5: 🔥 CRITICAL FIX - Ensure user name is set BEFORE UI
++        # Ensure user name is set BEFORE UI
+         print("👤 Setting up user profile...")
+-        user_name = ensure_user_name()  # 🔥 YEH LINE ADD KARNA HAI
++        user_name = "User"
+         print(f"✅ User profile set: {user_name}")
+         
+         # STEP 6: ONLY AFTER ALL VERIFICATIONS - Show UI
+@@ -1384,35 +2111,20 @@ def main():
+         
+         def show_main_and_keep_alive():
+             print("🔄 Transitioning to premium main window...")
+-            scanning_window.close()
++            try:
++                scanning_window.close()
++            except RuntimeError:
++                pass  # Already deleted by WA_DeleteOnClose
+             
+-            # Show and activate premium main window
+-            main_window.show()
++            # Show and activate premium main window maximized
++            main_window.showMaximized()
+             main_window.raise_()
+             main_window.activateWindow()
+-            
+-            # Force focus and prevent minimization
+-            main_window.setWindowFlags(main_window.windowFlags() | Qt.WindowStaysOnTopHint)
+-            main_window.show()
++            main_window.setFocus()
+             
+             print("✅ PREMIUM MAIN WINDOW SHOULD BE VISIBLE NOW!")
+-            print("📍 Look for the LOVELY circular interface at screen center")
+-            print("💫 Hover over the glowing 'M' to reveal premium controls")
+-            print(f"👤 Welcome, {user_name}!")  # 🔥 YEH BHI ADD KARNA HAI
+-            
+-            # Keep checking window status
+-            def check_window_status():
+-                if main_window.isVisible():
+-                    print("🎯 Premium window active - EXCELLENT!")
+-                else:
+-                    print("❌ Window lost - RESTORING LOVELY INTERFACE!")
+-                    main_window.show()
+-                    main_window.raise_()
+-            
+-            # Check every 5 seconds
+-            status_timer = QTimer()
+-            status_timer.timeout.connect(check_window_status)
+-            status_timer.start(5000)
++            print(f"👤 Welcome, {user_name}!")
++            app.setQuitOnLastWindowClosed(True)
+         
+         # Show main window after scanning with delay
+         QTimer.singleShot(3500, show_main_and_keep_alive)

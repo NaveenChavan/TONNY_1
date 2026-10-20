@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Advanced Data Analysis Report</title>
+<style>
+:root {
+    --primary: #4361ee;
+    --secondary: #3f37c9;
+    --accent: #f72585;
+    --light: #f8f9fa;
+    --dark: #212529;
+    --success: #4cc9f0;
+    --warning: #f8961e;
+    --danger: #ef233c;
+}
+body {
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    margin: 0;
+    background: linear-gradient(135deg, #f5f7fa 0%, #e4e8f0 100%);
+    color: var(--dark);
+    line-height: 1.6;
+}
+.container {
+    max-width: 1200px;
+    margin: 30px auto;
+    background: white;
+    padding: 40px;
+    border-radius: 16px;
+    box-shadow: 0 15px 40px rgba(0,0,0,0.08);
+    position: relative;
+    overflow: hidden;
+}
+.container::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 8px;
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+}
+.header {
+    text-align: center;
+    margin-bottom: 50px;
+    position: relative;
+    padding-bottom: 20px;
+}
+.header::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 25%;
+    width: 50%;
+    height: 3px;
+    background: linear-gradient(90deg, transparent, var(--primary), transparent);
+}
+h1, h2, h3 {
+    color: var(--dark);
+    margin-top: 0;
+}
+h1 {
+    font-size: 2.5rem;
+    margin-bottom: 10px;
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    display: inline-block;
+}
+h2 {
+    font-size: 1.8rem;
+    margin-bottom: 20px;
+    border-bottom: 2px solid var(--light);
+    padding-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+h2::before {
+    content: "";
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    background: var(--primary);
+    border-radius: 3px;
+}
+.section {
+    margin: 40px 0;
+    padding: 30px;
+    background: var(--light);
+    border-radius: 12px;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.03);
+}
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 25px;
+    margin: 25px 0;
+}
+.metric-card {
+    background: linear-gradient(135deg, var(--primary), var(--secondary));
+    color: white;
+    padding: 25px;
+    border-radius: 12px;
+    text-align: center;
+    box-shadow: 0 10px 20px rgba(67, 97, 238, 0.2);
+}
+.metric-card h3 {
+    font-size: 2.2rem;
+    margin: 10px 0;
+    color: white;
+}
+.metric-card p {
+    opacity: 0.9;
+    margin: 0;
+    font-size: 1rem;
+}
+.insight-item {
+    margin: 18px 0;
+    padding: 20px;
+    background: white;
+    border-radius: 10px;
+    border-left: 4px solid var(--accent);
+    box-shadow: 0 5px 15px rgba(0,0,0,0.03);
+}
+.stats-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 25px 0;
+    overflow: hidden;
+    border-radius: 12px;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+}
+.stats-table th {
+    background: linear-gradient(135deg, var(--primary), var(--secondary));
+    color: white;
+    padding: 15px;
+    text-align: left;
+    font-weight: 600;
+}
+.stats-table td {
+    padding: 15px;
+    border-bottom: 1px solid rgba(0,0,0,0.05);
+    background: white;
+}
+.stats-table tr:last-child td {
+    border-bottom: none;
+}
+.footer {
+    text-align: center;
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid rgba(0,0,0,0.1);
+    color: rgba(0,0,0,0.6);
+}
+.emoji {
+    font-size: 1.2em;
+    vertical-align: middle;
+    margin-right: 5px;
+}
+.correlation-strength {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-left: 5px;
+}
+.strong {
+    background: rgba(76, 201, 240, 0.2);
+    color: #4cc9f0;
+}
+.moderate {
+    background: rgba(248, 150, 30, 0.2);
+    color: #f8961e;
+}
+.weak {
+    background: rgba(239, 35, 60, 0.2);
+    color: #ef233c;
+}
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head><body>
+<div class="container">
+<div class="header">
+<h1><span class="emoji">📊</span> Advanced Data Analysis Report</h1>
+<p>Generated on July 13, 2025 at 07:42 PM</p>
+<p>Business Domain: <strong style="color: var(--primary);">Unknown</strong></p>
+</div>
+<div class="section">
+<h2><span class="emoji">📈</span> Dataset Overview</h2>
+<div class="metric-grid">
+<div class="metric-card"><h3>3,774</h3><p>Total Records</p></div>
+<div class="metric-card"><h3>26</h3><p>Total Columns</p></div>
+<div class="metric-card"><h3>100.0%</h3><p>Data Quality Score</p></div>
+<div class="metric-card"><h3>0</h3><p>Key Metrics</p></div>
+</div></div>
+<div class="section"><h2><span class="emoji">🎯</span> Key Performance Insights</h2><h3><span class="emoji">🔍</span> Business Intelligence</h3><div class="insight-item">✨ Strong strong positive correlation (0.916) between Close_AAPL and Close_AMZN suggests potential business relationship.</div><div class="insight-item">✨ Strong strong positive correlation (0.974) between Close_AAPL and Close_GOOGL suggests potential business relationship.</div><h3><span class="emoji">🔗</span> Key Relationships</h3>
+                    <div class="insight-item">
+                        <strong>Close_AAPL</strong> ↔ <strong>Close_AMZN</strong>: 
+                        <span class="correlation-strength strong">strong</span> correlation (r = 0.916)
+                    </div>
+                    <div class="insight-item">
+                        <strong>Close_AAPL</strong> ↔ <strong>Close_GOOGL</strong>: 
+                        <span class="correlation-strength strong">strong</span> correlation (r = 0.974)
+                    </div>
+                    <div class="insight-item">
+                        <strong>Close_AAPL</strong> ↔ <strong>Close_MSFT</strong>: 
+                        <span class="correlation-strength strong">strong</span> correlation (r = 0.987)
+                    </div></div>
+<div class="section"><h2><span class="emoji">📊</span> Data Quality Assessment</h2>
+<div class="metric-grid">
+<div class="metric-card"><h3>0.0%</h3><p>Missing Data</p></div>
+<div class="metric-card"><h3>0</h3><p>Duplicate Records</p></div>
+<div class="metric-card"><h3>0</h3><p>Potential Outliers</p></div>
+<div class="metric-card"><h3>0</h3><p>Data Inconsistencies</p></div>
+</div></div>
+<div class="section"><h2><span class="emoji">📋</span> Executive Summary</h2>
+<p>This comprehensive analysis of your <strong>Unknown</strong> dataset reveals valuable insights from <strong>3,774</strong> records across <strong>26</strong> variables. The report highlights:</p>
+<ul style="margin-left: 20px; padding-left: 20px;">
+<li><strong>0</strong> key performance metrics with detailed statistics</li>
+<li><strong>2</strong> actionable business insights</li>
+<li><strong>28</strong> significant data relationships</li>
+<li>Overall data quality score of <strong>100.0%</strong></li>
+</ul>
+</div>
+<div class="footer">
+<p>Report generated automatically by Advanced Analytics Engine</p>
+</div></div></body></html>

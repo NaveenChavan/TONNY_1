@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.db
+*.log
+*.json
+!package.json
+!tsconfig.json
+*.spec
+__pycache__/
+*.py[cod]
+build/
+dist/
+.venv/
+venv/
+serviceAccount.json
+mj original/serviceAccount.json

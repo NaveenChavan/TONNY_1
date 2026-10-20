@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Advanced Data Analysis Report</title>
+<style>
+:root {
+    --primary: #6366f1;
+    --primary-dark: #4f46e5;
+    --secondary: #8b5cf6;
+    --accent: #ec4899;
+    --success: #22c55e;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --info: #06b6d4;
+    --dark: #0f172a;
+    --darker: #020617;
+    --gray: #94a3b8;
+    --light: #f8fafc;
+    --border: #1e293b;
+    --card-bg: rgba(30, 41, 59, 0.6);
+}
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    background: linear-gradient(135deg, var(--darker), var(--dark));
+    color: var(--light);
+    line-height: 1.6;
+    padding: 20px;
+    min-height: 100vh;
+}
+.report-container {
+    max-width: 1200px;
+    margin: 20px auto;
+    background: rgba(15, 23, 42, 0.8);
+    border-radius: 24px;
+    overflow: hidden;
+    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(99, 102, 241, 0.2);
+}
+.report-header {
+    background: linear-gradient(135deg, var(--primary), var(--secondary));
+    color: white;
+    padding: 50px 40px;
+    position: relative;
+    text-align: center;
+    overflow: hidden;
+}
+.report-header::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 4px;
+    background: linear-gradient(90deg, var(--success), var(--info), var(--warning), var(--accent));
+}
+.header-content {
+    max-width: 800px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 2;
+}
+.report-title {
+    font-size: 3rem;
+    font-weight: 800;
+    margin-bottom: 15px;
+    letter-spacing: -0.5px;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.2);
+}
+.report-subtitle {
+    font-size: 1.2rem;
+    opacity: 0.9;
+    margin-bottom: 25px;
+    font-weight: 400;
+}
+.report-meta {
+    display: flex;
+    justify-content: center;
+    gap: 30px;
+    margin-top: 25px;
+    flex-wrap: wrap;
+}
+.meta-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.15);
+    padding: 12px 24px;
+    border-radius: 50px;
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255,255,255,0.1);
+}
+.section {
+    padding: 45px;
+    border-bottom: 1px solid var(--border);
+}
+.section:last-child {
+    border-bottom: none;
+}
+.section-title {
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--primary);
+    margin-bottom: 35px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+.section-title::after {
+    content: "";
+    flex: 1;
+    height: 2px;
+    background: linear-gradient(90deg, var(--primary), transparent);
+    margin-left: 20px;
+    opacity: 0.3;
+}
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 30px;
+    margin: 35px 0;
+}
+.metric-card {
+    background: var(--card-bg);
+    border-radius: 16px;
+    padding: 30px;
+    text-align: center;
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    position: relative;
+    overflow: hidden;
+}
+.metric-card:hover {
+    transform: translateY(-8px);
+    box-shadow: 0 15px 30px rgba(0,0,0,0.25);
+    border-color: rgba(99, 102, 241, 0.4);
+}
+.metric-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 4px;
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+}
+.metric-value {
+    font-size: 2.8rem;
+    font-weight: 800;
+    margin: 20px 0;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.metric-label {
+    color: var(--gray);
+    font-size: 1.1rem;
+    font-weight: 500;
+}
+.insight-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 30px;
+    margin-top: 30px;
+}
+.insight-card {
+    background: var(--card-bg);
+    border-radius: 16px;
+    padding: 30px;
+    border-left: 4px solid var(--primary);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+    transition: all 0.4s ease;
+    position: relative;
+    overflow: hidden;
+}
+.insight-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 12px 30px rgba(0,0,0,0.25);
+}
+.insight-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 60px;
+    height: 60px;
+    background: linear-gradient(45deg, var(--primary), transparent 70%);
+    border-radius: 0 16px 0 100%;
+}
+.insight-content {
+    font-size: 1.15rem;
+    line-height: 1.7;
+    position: relative;
+    z-index: 2;
+}
+.insight-icon {
+    font-size: 2rem;
+    margin-bottom: 20px;
+    color: var(--primary);
+    position: relative;
+    z-index: 2;
+}
+.correlation-item {
+    display: flex;
+    align-items: center;
+    padding: 25px;
+    background: var(--card-bg);
+    border-radius: 16px;
+    margin: 20px 0;
+    border-left: 4px solid var(--info);
+    transition: all 0.3s ease;
+}
+.correlation-item:hover {
+    transform: translateX(5px);
+    border-left-width: 6px;
+}
+.stats-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 35px 0;
+    overflow: hidden;
+    border-radius: 16px;
+    background: var(--card-bg);
+    box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+}
+.stats-table th {
+    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    color: white;
+    padding: 20px 25px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 1.1rem;
+}
+.stats-table td {
+    padding: 18px 25px;
+    border-bottom: 1px solid var(--border);
+    color: var(--light);
+}
+.stats-table tr:last-child td {
+    border-bottom: none;
+}
+.stats-table tr:nth-child(even) {
+    background-color: rgba(30, 41, 59, 0.4);
+}
+.stats-table tr:hover td {
+    background-color: rgba(30, 41, 59, 0.8);
+}
+.executive-summary {
+    background: linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(15, 23, 42, 0.8));
+    border-radius: 20px;
+    padding: 40px;
+    margin-top: 30px;
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    position: relative;
+    overflow: hidden;
+}
+.executive-summary::before {
+    content: "";
+    position: absolute;
+    top: -50%;
+    right: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(circle, rgba(99, 102, 241, 0.1) 0%, transparent 70%);
+}
+.summary-points {
+    margin: 25px 0 0 30px;
+}
+.summary-points li {
+    margin-bottom: 20px;
+    position: relative;
+    padding-left: 35px;
+    font-size: 1.1rem;
+    line-height: 1.8;
+}
+.summary-points li::before {
+    content: "•";
+    color: var(--primary);
+    font-size: 2rem;
+    position: absolute;
+    left: 0;
+    top: -5px;
+}
+.report-footer {
+    text-align: center;
+    padding: 40px;
+    background: rgba(2, 6, 23, 0.7);
+    color: rgba(255,255,255,0.7);
+    position: relative;
+}
+.report-footer::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--primary), transparent);
+}
+.footer-note {
+    margin-top: 15px;
+    font-size: 0.95rem;
+    opacity: 0.7;
+}
+.correlation-strength {
+    display: inline-block;
+    padding: 6px 15px;
+    border-radius: 50px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-left: 10px;
+}
+.strong {
+    background: rgba(34, 197, 94, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+.moderate {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--warning);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+.weak {
+    background: rgba(239, 68, 68, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.glow {
+    text-shadow: 0 0 15px rgba(99, 102, 241, 0.5);
+}
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.section, .report-header, .report-footer {
+    animation: fadeIn 0.6s ease forwards;
+}
+@media (max-width: 768px) {
+    .section {
+        padding: 35px 25px;
+    }
+    .metric-grid {
+        grid-template-columns: 1fr;
+    }
+    .report-header {
+        padding: 40px 25px;
+    }
+    .report-title {
+        font-size: 2.4rem;
+    }
+}
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="report-container">
+    <div class="report-header">
+        <div class="header-content">
+            <h1 class="report-title glow">Advanced Data Insights Report</h1>
+            <p class="report-subtitle">Dark Theme Edition • Comprehensive Analytics</p>
+            
+            <div class="report-meta">
+                <div class="meta-item">
+                    <span>📅</span> July 13, 2025 at 08:46 PM
+                </div>
+                <div class="meta-item">
+                    <span>🏢</span> Domain: Unknown
+                </div>
+                <div class="meta-item">
+                    <span>📊</span> 516 records × 6 attributes
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2 class="section-title"><span>📈</span> Dataset Overview</h2>
+        <div class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-value">516</div>
+                <div class="metric-label">Total Records</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">6</div>
+                <div class="metric-label">Data Attributes</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">98.9%</div>
+                <div class="metric-label">Quality Score</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">1</div>
+                <div class="metric-label">Key Metrics</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2 class="section-title"><span>📊</span> Key Performance Insights</h2><table class="stats-table"><tr><th>Metric</th><th>Maximum</th><th>Minimum</th><th>Average</th><th>Median</th></tr><tr><td><strong>total_runs</strong></td><td>5,426.00</td><td>0.00</td><td>430.63</td><td>74.00</td></tr></table><h3 class="section-title" style="margin-top: 40px;"><span>🔍</span> Business Intelligence</h3><div class="insight-grid">
+                <div class="insight-card">
+                    <div class="insight-icon">✨</div>
+                    <div class="insight-content">The total_runs shows high variability with a 1260.0% range from mean, indicating potential opportunities for optimization.</div>
+                </div>
+                <div class="insight-card">
+                    <div class="insight-icon">✨</div>
+                    <div class="insight-content">Strong strong positive correlation (0.973) between total_runs and out suggests potential business relationship.</div>
+                </div>
+                <div class="insight-card">
+                    <div class="insight-icon">✨</div>
+                    <div class="insight-content">Strong strong positive correlation (0.996) between total_runs and numberofballs suggests potential business relationship.</div>
+                </div></div><h3 class="section-title" style="margin-top: 40px;"><span>🔗</span> Key Relationships</h3>
+                    <div class="correlation-item">
+                        <div style="flex: 1;">
+                            <strong>total_runs</strong> ↔ 
+                            <strong>out</strong>
+                        </div>
+                        <div>
+                            <span class="correlation-strength strong">Strong</span>
+                            <div style="margin-top: 8px; font-weight: 600; font-size: 1.1rem;">r = 0.973</div>
+                        </div>
+                    </div>
+                    <div class="correlation-item">
+                        <div style="flex: 1;">
+                            <strong>total_runs</strong> ↔ 
+                            <strong>numberofballs</strong>
+                        </div>
+                        <div>
+                            <span class="correlation-strength strong">Strong</span>
+                            <div style="margin-top: 8px; font-weight: 600; font-size: 1.1rem;">r = 0.996</div>
+                        </div>
+                    </div>
+                    <div class="correlation-item">
+                        <div style="flex: 1;">
+                            <strong>out</strong> ↔ 
+                            <strong>numberofballs</strong>
+                        </div>
+                        <div>
+                            <span class="correlation-strength strong">Strong</span>
+                            <div style="margin-top: 8px; font-weight: 600; font-size: 1.1rem;">r = 0.977</div>
+                        </div>
+                    </div></div>
+    
+    <div class="section">
+        <h2 class="section-title"><span>✅</span> Data Quality Assessment</h2>
+        <div class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-value">1.1%</div>
+                <div class="metric-label">Missing Values</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">0</div>
+                <div class="metric-label">Duplicate Records</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">0</div>
+                <div class="metric-label">Potential Outliers</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">0</div>
+                <div class="metric-label">Data Inconsistencies</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2 class="section-title"><span>📋</span> Executive Summary</h2>
+        <div class="executive-summary">
+            <p style="font-size: 1.2rem; margin-bottom: 25px; line-height: 1.8;">This comprehensive analysis of the <strong class="glow">Unknown</strong> dataset reveals valuable insights from <strong>516</strong> records across <strong>6</strong> attributes. Key findings include:</p>
+            
+            <ul class="summary-points">
+                <li><strong>1</strong> key performance metrics with detailed statistical analysis</li>
+                <li><strong>3</strong> actionable business insights identified</li>
+                <li><strong>3</strong> significant data relationships discovered</li>
+                <li>Overall data quality score of <strong>98.9%</strong> with recommendations for improvement</li>
+                <li>Advanced statistical analysis of key metrics and performance indicators</li>
+            </ul>
+        </div>
+    </div>
+    
+    <div class="report-footer">
+        <div style="font-size: 1.2rem; font-weight: 600;">Advanced Analytics Report | Confidential</div>
+        <div class="footer-note">Generated by Data Insights Engine v3.0 • Dark Theme</div>
+    </div>
+</div>
+</body>
+</html>

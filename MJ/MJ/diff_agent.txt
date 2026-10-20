@@ -1,0 +1,2453 @@
+diff --git a/mj original/Mj_agent.py b/core/runtime_agent.py
+index 9b1e374..5dac8bb 100644
+--- a/mj original/Mj_agent.py	
++++ b/core/runtime_agent.py
+@@ -1,735 +1,1781 @@
+-import asyncio
+-from livekit import rtc
+-from livekit.agents.utils import images
+-import asyncio
+-from livekit.rtc import VideoBufferType
+-from typing import Any, List, Optional
++import sys
++import builtins
++
++# Safe print wrapper to prevent UnicodeEncodeError on legacy Windows consoles
++_original_print = print
++def print(*args, **kwargs):
++    enc = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
++    new_args = []
++    for arg in args:
++        if isinstance(arg, str):
++            try:
++                arg.encode(enc)
++                new_args.append(arg)
++            except UnicodeEncodeError:
++                new_args.append(arg.encode(enc, errors='replace').decode(enc))
++        else:
++            new_args.append(arg)
++    _original_print(*new_args, **kwargs)
++
++builtins.print = print
++
++if __name__ == "__main__":
++    sys.modules['agent'] = sys.modules['__main__']
++
++# =========================
++# ENV + CORE IMPORTS
++# =========================
+ from dotenv import load_dotenv
+-from datetime import datetime
+-from livekit import agents
+-from livekit.agents import AgentSession, Agent, RoomInputOptions
+-from livekit.plugins import noise_cancellation
+-from livekit.plugins import google
+-from livekit.agents.llm.chat_context import ChatContext
++import asyncio
++import os
+ import numpy as np
+-import cv2
+-from collections import deque
++import time
+ import json
+-import base64
++import socket
+ import logging
+-import time
+-import asyncio
++from datetime import datetime
++from pathlib import Path
++from typing import Dict, Any, Optional, List
+ 
+-# From your LiveKit / RTC package
+-from livekit import rtc
+-from livekit.rtc import VideoBufferType
+-import asyncio
+-from livekit import rtc
+-from livekit.agents import Agent, get_job_context
+-from livekit.agents.llm import ImageContent
+-import base64
+-from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
++load_dotenv()
+ 
++logging.basicConfig(level=logging.WARNING)
++logger = logging.getLogger(__name__)
+ 
++# =========================
++# LIVEKIT IMPORTS
++# =========================
++from livekit import agents, rtc
++from livekit.agents import Agent, AgentSession, RoomInputOptions
++from livekit.plugins import noise_cancellation
++from livekit.plugins import silero
++
++# =========================
++# THREAD SAFETY & STATE
++# =========================
++import threading
++import enum
++
++class TonyState(enum.Enum):
++    BOOTING = "booting"
++    IDLE = "idle"
++    WAKE_DETECTED = "wake_detected"
++    LISTENING = "listening"
++    PROCESSING = "processing"
++    EXECUTING = "executing"
++    SPEAKING = "speaking"
++    ERROR = "error"
++    SHUTTING_DOWN = "shutting_down"
++    OFFLINE = "offline"
++
++# Singleton tracking — actual references, not gc scans
++_runtime_state = {
++    "tony_instance": None,
++    "session": None,
++    "vad": None,
++    "consumer_task": None,
++    "wake_detector": None,
++    "mic_capture": None,
++    "state": TonyState.BOOTING,
++    "is_active": False,
++    "is_processing": False,
++    "active_timeout_task": None,
++}
++
++_singleton_lock = threading.Lock()
++
++# =========================
++# WAKE-WORD DETECTOR (LOCAL ONNX)
++# =========================
++class WakeWordDetector:
++    """Local acoustic wake-word detector using openwakeword + hey_tony.onnx.
++
++    Processes raw 16 kHz int16 audio chunks and returns True on wake detection.
++    Includes a configurable cooldown to prevent duplicate triggers.
++    """
++
++    THRESHOLD = 0.3
++    COOLDOWN_SECS = 2.0
++
++    def __init__(self, model_path: str):
++        try:
++            from openwakeword.model import Model as OWWModel
++            self._model = OWWModel(
++                wakeword_models=[model_path],
++                inference_framework="onnx",
++            )
++            self._last_detection = 0.0
++            self._ready = True
++            print(f"[WAKE] Loaded wake-word model: {model_path}")
++        except Exception as e:
++            print(f"[WAKE] Failed to load wake-word model: {e}")
++            self._model = None
++            self._ready = False
++
++    @property
++    def ready(self) -> bool:
++        return self._ready
++
++    def process_audio(self, audio_int16: np.ndarray) -> bool:
++        """Feed a chunk of 16 kHz int16 audio.  Returns True on wake detection."""
++        if not self._ready or self._model is None:
++            return False
++        try:
++            prediction = self._model.predict(audio_int16)
++            for _key, score in prediction.items():
++                if score >= self.THRESHOLD:
++                    now = time.monotonic()
++                    if now - self._last_detection >= self.COOLDOWN_SECS:
++                        self._last_detection = now
++                        print(f"[WAKE] Wake word detected! score={score:.3f}")
++                        return True
++        except Exception as e:
++            print(f"[WAKE] Inference error: {e}")
++        return False
++
++    def reset_cooldown(self):
++        """Allow immediate re-detection (e.g. after command completes)."""
++        self._last_detection = 0.0
+ 
+-# Import prompts and tools
+-from prompts_mj import (
++
++# =========================
++# HEALTH SNAPSHOT
++# =========================
++async def _health_snapshot_loop():
++    """Print compact health every 2 seconds using actual tracked singletons."""
++    while True:
++        await asyncio.sleep(2.0)
++        try:
++            s = _runtime_state
++            ct = s.get("consumer_task")
++            consumer_status = "running" if ct and not ct.done() else "stopped"
++            loop = asyncio.get_running_loop()
++            tasks = len(asyncio.all_tasks(loop))
++            print(
++                f"[HEALTH] state={s['state'].value} "
++                f"tony={'1' if s['tony_instance'] else '0'} "
++                f"session={'1' if s['session'] else '0'} "
++                f"vad={'1' if s['vad'] else '0'} "
++                f"wake={'1' if s['wake_detector'] else '0'} "
++                f"mic={'1' if s['mic_capture'] else '0'} "
++                f"consumer={consumer_status} "
++                f"tasks={tasks} "
++                f"threads={threading.active_count()}"
++            )
++        except Exception:
++            pass
++
++
++# Gemini realtime (network-safe & import-safe)
++network_available = False
++import_error = None
++try:
++    from livekit.plugins.google.realtime import RealtimeModel
++    network_available = True
++except Exception as e1:
++    try:
++        from livekit.plugins.google.beta.realtime import RealtimeModel
++        network_available = True
++    except Exception as e2:
++        import_error = f"Path 1: {e1} | Path 2: {e2}"
++        print(f"[WARN] Failed to import RealtimeModel from both paths: {import_error}")
++
++# =========================
++# PROMPTS
++# =========================
++from .prompts import (
+     AGENT_INSTRUCTION,
+     SESSION_INSTRUCTION,
+-    AGENT_INSTRUCTION_FOR_TOOLS
++    AGENT_INSTRUCTION_FOR_TOOLS,
+ )
+ 
+-from tools import (
+-    get_weather,
+-    search_web,
+-    play_media,
+-    get_time_info,
+-    system_power_action,
+-    manage_window,
+-    desktop_control,
+-    list_active_windows,
+-    manage_window_state,
+-    get_today_reminder_message_from_db,
+-    say_reminder,
+-    send_whatsapp_message,
+-    write_in_notepad,
+-    open_app,
+-    press_key,
+-    get_system_info,
+-    type_user_message_auto,
+-    scan_system_for_viruses,
+-    control_ac_bulb,
+-    use_smart_clipboard,
+-    control_system_volume,
++# =========================
++# TOOLS (ALL)
++# =========================
++from Tools.manage_windows import manage_window, list_windows
++from Tools.search_web import search_web
++from Tools.send_whatsapp_message import send_whatsapp_message, send_whatsapp_message_advanced
++from Tools.system_power_action import system_power_action
++from Tools.type_user_message_auto import type_user_message_auto, create_essay_in_notepad, write_essay_in_notepad
++from Tools.write_in_notepad import write_in_notepad
++from Tools.desktop_control import desktop_control
++from Tools.scroll_content import scroll_content
++from Tools.file_searching import universal_file_opener
++from Tools.press_key import press_key, use_smart_clipboard
++from Tools.open_app import open_app
++from Tools.time_volume_bright import (
+     control_screen_brightness,
+-    execute_multi_task,
+-    send_email,
+-    # analyze_dataset,
+-    analyze_groundwater_dataset,
+-    open_app_on_screen,
+-    use_smart_selector,
+-    control_media,
+-    # generate_image_from_prompt
+-    generate_ai_image,
+-    generate_ai_video
+-    # enable_camera_analysis,
+-    # analyze_visual_scene,
+-    
+-    
++    control_system_volume,
++    get_time_info,
++    get_weather,
++    get_system_info_deep,
++    get_current_volume,
++    get_system_status,
+ )
+-
+-
+-
+-import time
+-import logging
+-import os
+-from logging.handlers import RotatingFileHandler  # For log rotation
+-
+-
+-load_dotenv()
+-
+-class Assistant(Agent):
+-    def __init__(self) -> None:
+-        import tools
+-        tools.assistant_instance = self
+-
+-        self._last_frame_sent = 0
+-        self._frame_send_interval = 0.5 
+-
+-        # --- Define Feature Mapping ---
+-        FEATURE_MAP = {
+-            "base": [
+-                search_web,
+-                get_time_info,
+-                open_app,
+-                get_system_info,
+-            ],
+-            "premium": [
+-                search_web,
+-                get_time_info,
+-                open_app,
+-                get_system_info,
+-                system_power_action,
+-                get_weather,
+-                manage_window,
+-                list_active_windows,
+-                play_media,
+-                press_key,
+-                manage_window_state,
+-                type_user_message_auto,
+-            ],
+-            "elite": [
+-                search_web,
+-                get_time_info,
+-                open_app,
+-                get_system_info,
+-                system_power_action,
+-                get_weather,
+-                manage_window,
+-                list_active_windows,
+-                play_media,
+-                press_key,
+-                manage_window_state,
+-                type_user_message_auto,
+-                desktop_control,
+-                scan_system_for_viruses,
+-                send_whatsapp_message,
+-                write_in_notepad,
+-                # send_email,
+-                # control_ac_bulb, 
+-                use_smart_clipboard, control_system_volume, control_screen_brightness,execute_multi_task,analyze_groundwater_dataset,open_app_on_screen,
+-                use_smart_selector,control_media,generate_ai_image
+-            ],
+-        }
+-
+-        # --- Decide Variant (from ENV) ---
+-        variant = os.getenv("NOVA_VARIANT", "base").lower()
+-        if variant not in FEATURE_MAP:
+-            print(f"[WARN] Unknown variant '{variant}', defaulting to Base.")
+-            variant = "base"
+-
+-        # --- Initialize Only Allowed Tools ---
+-        allowed_tools = FEATURE_MAP[variant]
+-        self._tools = self._initialize_tools(allowed_tools)
+-
+-        print(f"[INFO] Assistant initialized with variant: {variant} ({len(allowed_tools)} tools)")
+-
+-        # self._tools = self._initialize_tools([
+-
+-        #         get_time_info,
+-        #         open_app,
+-        #         get_system_info,
+-        #         system_power_action,
+-        #         get_weather,
+-        #         manage_window,
+-        #         list_active_windows,
+-        #         play_media,
+-        #         press_key,
+-        #         manage_window_state,
+-        #         type_user_message_auto,
+-        #         desktop_control,
+-        #         scan_system_for_viruses,
+-        #         send_whatsapp_message,
+-        #         write_in_notepad,
+-        #         # send_email,
+-        #         control_ac_bulb, use_smart_clipboard, control_system_volume, control_screen_brightness,execute_multi_task,open_app_on_screen,
+-        #         use_smart_selector,
+-        #         control_media
+-        # ])
+-
+-
+-        super().__init__(
+-            instructions=self._build_instructions(),
+-            llm=google.beta.realtime.RealtimeModel(
+-                voice="Aoede",
+-                temperature=0.5,
+-                top_p=0.9,
+-                
+-            ),
+-            tools=self._tools,
+-        )
+-        
+-        # State tracking
+-        self._last_tool_used: Optional[str] = None
+-        self._last_tool_success: bool = False
+-        self._chat_log_path = "chat_log.txt"
+- 
+-        self._min_frame_interval: float = 2  # Process one frame every 0.5s (2 FPS max)
+-        self._max_buffer_size: int = 20        # Store a max of 20 frames (~10 seconds of context)
+-        self._max_frames_to_send: int = 1      # Send a maximum of 3 frames to the API
+-        
+-        # Visual Analysis Runtime State
+-        self._frame_buffer = deque(maxlen=self._max_buffer_size) # Use deque for efficiency
+-        self._last_frame_time: float = 0
+-        self._visual_analysis_enabled: bool = False
+-        self._is_analyzing: bool = False
+-        self._last_analysis_time: float = 0  # Track last time analyze_current_scene() was called
+-        self._analysis_throttle: float = 2.0 
+-        self._analysis_lock = asyncio.Lock()
+-        self._latest_frame: Optional[rtc.VideoFrame] = None
+-        
+-
+-    async def process_visual_frame(self, video_frame: rtc.VideoFrame):
+-        """Process incoming video frames and send to realtime session"""
++from Tools.news_provider import get_top_news
++from Tools.youtube_videos import play_media
++from Tools.reminder import set_reminder, view_reminders, cancel_reminder
++
++# =========================
++# NEW TOOLS (from mj original)
++# =========================
++try:
++    from Tools.spotify import (
++        open_spotify, spotify_next, spotify_previous,
++        spotify_play_song, spotify_play_liked, spotify_pause
++    )
++except Exception as _e:
++    print(f"[IMPORT] spotify tools skipped: {_e}")
++    open_spotify = spotify_next = spotify_previous = None
++    spotify_play_song = spotify_play_liked = spotify_pause = None
++
++try:
++    from Tools.generate_ai_image import generate_ai_image
++except Exception as _e:
++    print(f"[IMPORT] generate_ai_image skipped: {_e}")
++    generate_ai_image = None
++
++try:
++    from Tools.scan_system_for_viruses import scan_system_for_viruses
++except Exception as _e:
++    print(f"[IMPORT] scan_system_for_viruses skipped: {_e}")
++    scan_system_for_viruses = None
++
++try:
++    from Tools.multi_task import execute_multi_task
++except Exception as _e:
++    print(f"[IMPORT] multi_task skipped: {_e}")
++    execute_multi_task = None
++
++try:
++    from Tools.send_media_whatsapp import send_media_to_whatsapp
++except Exception as _e:
++    print(f"[IMPORT] send_media_whatsapp skipped: {_e}")
++    send_media_to_whatsapp = None
++
++try:
++    from Tools.word_to_pdf import (
++        word_to_pdf, excel_to_pdf, ppt_to_pdf, image_to_pdf, convert_image_format
++    )
++except Exception as _e:
++    print(f"[IMPORT] word_to_pdf tools skipped: {_e}")
++    word_to_pdf = excel_to_pdf = ppt_to_pdf = image_to_pdf = convert_image_format = None
++
++try:
++    from Tools.create_folder import create_here
++except Exception as _e:
++    print(f"[IMPORT] create_folder skipped: {_e}")
++    create_here = None
++
++# =========================
++# GUI CALLBACKS & SIGNAL BRIDGE
++# =========================
++import re
++import functools
++
++_gui_callbacks = {
++    'update_status': None,
++    'update_command': None,
++    'update_response': None,
++    'update_connection': None,
++    'update_latency': None,
++    'update_mic_status': None,
++    # Streaming callbacks for word-by-word chat display
++    'stream_start': None,
++    'stream_chunk': None,
++    'stream_end': None,
++    # Partial-transcript streaming (replaces current text instead of appending)
++    'stream_replace': None,
++    # One-shot static bubble (used when loading history)
++    'add_static_bubble': None,
++}
++
++active_room = None
++worker_loop = None
++
++def setup_rpc_proxies():
++    import json
++    keys = [
++        'stream_start', 'stream_chunk', 'stream_end', 'stream_replace',
++        'update_response', 'update_command', 'update_status',
++        'update_connection', 'update_latency', 'update_mic_status',
++        'add_static_bubble'
++    ]
++    for key in keys:
++        if _gui_callbacks.get(key) is None:
++            def make_proxy(k):
++                def proxy(*args):
++                    global active_room, worker_loop
++                    if active_room and active_room.isconnected() and worker_loop:
++                        try:
++                            payload = json.dumps({"callback": k, "args": list(args)})
++                            asyncio.run_coroutine_threadsafe(
++                                active_room.local_participant.publish_data(payload, topic="tony_gui_rpc"),
++                                worker_loop
++                            )
++                        except Exception as e:
++                            pass
++                return proxy
++            _gui_callbacks[key] = make_proxy(key)
++
++def register_gui_callbacks(update_status=None, update_command=None, update_response=None,
++                           update_connection=None, update_latency=None, update_mic_status=None,
++                           stream_start=None, stream_chunk=None, stream_end=None,
++                           stream_replace=None, add_static_bubble=None):
++    _gui_callbacks['update_status'] = update_status
++    _gui_callbacks['update_command'] = update_command
++    _gui_callbacks['update_response'] = update_response
++    _gui_callbacks['update_connection'] = update_connection
++    _gui_callbacks['update_latency'] = update_latency
++    _gui_callbacks['update_mic_status'] = update_mic_status
++    _gui_callbacks['stream_start'] = stream_start
++    _gui_callbacks['stream_chunk'] = stream_chunk
++    _gui_callbacks['stream_end'] = stream_end
++    _gui_callbacks['stream_replace'] = stream_replace
++    _gui_callbacks['add_static_bubble'] = add_static_bubble
++
++def update_gui_status(status: str):
++    if _gui_callbacks['update_status']:
++        _gui_callbacks['update_status'](status)
++
++def update_gui_command(command: str):
++    """Legacy: show user command as a static bubble."""
++    if _gui_callbacks.get('add_static_bubble'):
+         try:
+-            # ✅ FIXED: Add frame rate control
+-            current_time = time.time()
+-            if current_time - self._last_frame_sent < self._frame_send_interval:
+-                return
+-                
+-            self._last_frame_sent = current_time
+-            
+-            print(f"📹 Processing video frame: {video_frame.width}x{video_frame.height}")
+-            
+-            # Store the latest frame for potential analysis
+-            self._latest_frame = video_frame
+-            
+-            # Send frame to realtime session if available
+-            if hasattr(self, '_activity') and self._activity:
+-                processed_frame = self._prepare_video_frame(video_frame)
+-                self._activity.push_video(processed_frame)
+-                print("✅ Frame sent to activity")
+-                
+-                # Optional: Add to buffer for analysis
+-                await self._add_frame_to_buffer(processed_frame)
+-            else:
+-                print("❌ No activity available for video frame")
+-                
+-        except Exception as e:
+-            print(f"❌ Video frame processing error: {str(e)}")
+-
+-    def _prepare_video_frame(self, frame: rtc.VideoFrame) -> rtc.VideoFrame:
+-        """Ensure video frame is in the correct format for the realtime model"""
+-        # Convert to RGBA if needed
+-        if frame.type != VideoBufferType.RGBA:
+-            # Convert frame data to RGBA
+-            rgba_data = self._convert_to_rgba(frame)
+-            return rtc.VideoFrame(
+-                width=frame.width,
+-                height=frame.height,
+-                type=VideoBufferType.RGBA,
+-                data=rgba_data
+-            )
+-        return frame
+-
+-    def _convert_to_rgba(self, frame: rtc.VideoFrame) -> bytes:
+-        """Convert frame data to RGBA format"""
+-        # Implementation depends on your frame type
+-        if frame.type == VideoBufferType.RGB:
+-            # Convert RGB to RGBA
+-            rgb_array = np.frombuffer(frame.data, dtype=np.uint8)
+-            rgb_array = rgb_array.reshape((frame.height, frame.width, 3))
+-            rgba_array = np.dstack([rgb_array, np.full((frame.height, frame.width), 255, dtype=np.uint8)])
+-            return rgba_array.tobytes()
+-        # Add other conversions as needed
+-        return frame.data
+-
+-    async def _add_frame_to_buffer(self, frame: rtc.VideoFrame):
+-        """Add frame to buffer for potential analysis"""
+-        current_time = time.time()
++            _gui_callbacks['add_static_bubble']('You', command)
++        except Exception:
++            pass
++    elif _gui_callbacks.get('update_command'):
++        _gui_callbacks['update_command'](command)
++
++# -----------------------------------------------------------------------
++# PARTIAL TRANSCRIPT — same bubble updates as user speaks, then finalizes
++# -----------------------------------------------------------------------
++_partial_transcript_open = False
++
++def update_gui_partial_transcript(text: str, is_final: bool):
++    """Show partial STT transcript in-place; create one bubble until is_final."""
++    global _partial_transcript_open
++    if not text or not text.strip():
++        return
++    has_stream = (
++        _gui_callbacks.get('stream_start') and
++        _gui_callbacks.get('stream_replace') and
++        _gui_callbacks.get('stream_end')
++    )
++    if not has_stream:
++        # Fallback
++        if is_final:
++            update_gui_command(text)
++        return
++    if not _partial_transcript_open:
++        try:
++            _gui_callbacks['stream_start']('You')
++        except Exception:
++            return
++        _partial_transcript_open = True
++    try:
++        _gui_callbacks['stream_replace'](text)
++    except Exception:
++        pass
++    if is_final:
++        try:
++            _gui_callbacks['stream_end']()
++        except Exception:
++            pass
++        _partial_transcript_open = False
++
++
++# -----------------------------------------------------------------------
++# STREAMING RESPONSE — word-by-word push to GUI
++# -----------------------------------------------------------------------
++import threading
++_stream_lock = threading.Lock()
++_current_stream_timer: list = []  # holds pending timers so they can be cancelled
++
++def _cancel_pending_stream():
++    """Cancel any in-flight streaming from previous response."""
++    with _stream_lock:
++        for item in _current_stream_timer:
++            # item is either a threading.Timer (old) or threading.Event (new stop_flag)
++            if isinstance(item, threading.Event):
++                item.set()  # Signal the stream loop thread to stop
++            elif hasattr(item, 'cancel'):
++                item.cancel()  # Legacy timer cancel
++        _current_stream_timer.clear()
++
++def update_gui_response(response: str):
++    """Stream the response word-by-word to the GUI chat bubble."""
++    if not response or not response.strip():
++        return
++
++    # Cancel any previously streaming response
++    _cancel_pending_stream()
++
++    has_streaming = (
++        _gui_callbacks.get('stream_start') and
++        _gui_callbacks.get('stream_chunk') and
++        _gui_callbacks.get('stream_end')
++    )
++
++    if not has_streaming:
++        # Fallback: old-style single-shot update
++        if _gui_callbacks.get('update_response'):
++            _gui_callbacks['update_response'](response)
++        return
++
++    # Start a new streaming bubble
++    try:
++        _gui_callbacks['stream_start']('TONY')
++    except Exception:
++        return
++
++    # FIX 3: Single background thread loop instead of N threading.Timer objects
++    # Yeh approach GUI smooth rakhti hai — koi timer-thread spam nahi
++    words = response.split()
++    CHUNK_SIZE = 3          # words per chunk
++    DELAY_SEC = 0.055       # 55ms between chunks — ~300 wpm feel
++
++    chunks = []
++    for i in range(0, len(words), CHUNK_SIZE):
++        chunk = ' '.join(words[i:i + CHUNK_SIZE])
++        if i + CHUNK_SIZE < len(words):
++            chunk += ' '
++        chunks.append(chunk)
++
++    # Capture a stop flag so _cancel_pending_stream() can abort mid-stream
++    stop_flag = threading.Event()
++
++    def _stream_loop():
++        for idx, chunk in enumerate(chunks):
++            if stop_flag.is_set():
++                break
++            is_last = (idx == len(chunks) - 1)
++            try:
++                if _gui_callbacks.get('stream_chunk'):
++                    _gui_callbacks['stream_chunk'](chunk)
++                if is_last and _gui_callbacks.get('stream_end'):
++                    _gui_callbacks['stream_end']()
++            except Exception as e:
++                print(f"[STREAM] chunk send error: {e}")
++                break
++            if not is_last:
++                stop_flag.wait(timeout=DELAY_SEC)   # interruptible sleep
++
++    t = threading.Thread(target=_stream_loop, daemon=True, name="GUI-Stream")
++
++    with _stream_lock:
++        # Store (thread, stop_flag) so cancel can signal it
++        _current_stream_timer.append(stop_flag)  # repurpose list to hold stop flags
++        t.start()
++
++def update_gui_connection(status_str: str):
++    if _gui_callbacks['update_connection']:
++        _gui_callbacks['update_connection'](status_str)
++
++def update_gui_latency(last: float, avg: float):
++    if _gui_callbacks.get('update_latency'):
++        _gui_callbacks['update_latency'](last, avg)
++
++def update_gui_mic_status(status: str):
++    if _gui_callbacks.get('update_mic_status'):
++        _gui_callbacks['update_mic_status'](status)
++
++
++# =========================
++# TOOL TIMING DECORATOR
++# =========================
++def make_timing_decorator(func):
++    if asyncio.iscoroutinefunction(func):
++        @functools.wraps(func)
++        async def async_wrapper(*args, **kwargs):
++            tool_name = func.__name__
++            print(f"[TOOL] {tool_name} started")
++            start_time = time.monotonic()
++            try:
++                res = await func(*args, **kwargs)
++                duration = time.monotonic() - start_time
++                print(f"[TOOL] {tool_name} completed: {duration:.2f}s")
++                return res
++            except Exception as e:
++                duration = time.monotonic() - start_time
++                print(f"[TOOL] {tool_name} failed after {duration:.2f}s: {e}")
++                raise e
++        return async_wrapper
++    else:
++        @functools.wraps(func)
++        def sync_wrapper(*args, **kwargs):
++            tool_name = func.__name__
++            print(f"[TOOL] {tool_name} started")
++            start_time = time.monotonic()
++            try:
++                res = func(*args, **kwargs)
++                duration = time.monotonic() - start_time
++                print(f"[TOOL] {tool_name} completed: {duration:.2f}s")
++                return res
++            except Exception as e:
++                duration = time.monotonic() - start_time
++                print(f"[TOOL] {tool_name} failed after {duration:.2f}s: {e}")
++                raise e
++        return sync_wrapper
++
++
++# =========================
++# WAKE WORD & DIRECT ROUTER
++# =========================
++# =========================
++# WAKE WORD, DIRECT ROUTER & PERFORMANCE TIMERS
++# =========================
++import win32com.client
++
++class TurnTimer:
++    def __init__(self):
++        self.t0 = time.monotonic()  # Microphone detected / session start
++        self.t1 = None         # Speech started
++        self.t2 = None         # Speech ended
++        self.t3 = None         # Transcript received
++        self.t4 = None         # Command router started
++        self.t5 = None         # LLM request started
++        self.t6 = None         # LLM response received
++        self.t7 = None         # Tool started
++        self.t8 = None         # Tool completed
++        self.t9 = None         # Response started
++        self.t10 = None        # Response completed
+         
+-        # Throttle frame processing
+-        if current_time - self._last_frame_time < self._min_frame_interval:
++        self.command = ""
++        self.tool_name = ""
++        self.logged = False
++
++    def print_perf(self):
++        if self.logged:
+             return
+-            
+-        self._last_frame_time = current_time
++        self.logged = True
++        print("\n" + "="*50)
++        print(" [PERF] PERFORMANCE METRICS FOR THIS TURN:")
++        print(f" [PERF] Command: '{self.command}'")
+         
+-        # Add to buffer
+-        self._frame_buffer.append({
+-            'frame': frame,
+-            'timestamp': current_time
+-        })
++        # Calculate timings
++        if self.t1 and self.t3:
++            speech_end = self.t2 if self.t2 else self.t1
++            print(f"[PERF] Speech → Transcript: {self.t3 - speech_end:.2f}s")
++        if self.t3 and self.t4:
++            print(f"[PERF] Transcript → Router: {self.t4 - self.t3:.2f}s")
++        if self.t4 and self.t7:
++            print(f"[PERF] Router → Tool: {self.t7 - self.t4:.2f}s")
++        if self.t7 and self.t8:
++            print(f"[PERF] Tool: {self.t8 - self.t7:.2f}s")
++        if self.t9 and self.t10:
++            print(f"[PERF] TTS: {self.t10 - self.t9:.2f}s")
++            
++        start_time = self.t1 or self.t3 or self.t0
++        end_time = self.t10 or self.t8 or time.monotonic()
++        total_latency = end_time - start_time
++        print(f"[PERF] TOTAL: {total_latency:.2f}s")
++        print("="*50 + "\n")
+         
+-        # Optionally trigger analysis if enabled
+-        if self._visual_analysis_enabled and not self._is_analyzing:
+-            await self._analyze_if_needed()
++        global latency_history
++        latency_history.append(total_latency)
++        avg_latency = sum(latency_history) / len(latency_history)
++        update_gui_latency(total_latency, avg_latency)
++
++current_timer = None
++
++def get_or_create_timer():
++    global current_timer
++    if current_timer is None:
++        current_timer = TurnTimer()
++    return current_timer
++
++def reset_timer():
++    global current_timer
++    current_timer = TurnTimer()
++    return current_timer
++
++_runtime_state['is_active'] = False
++_runtime_state['active_timeout_task'] = None
++
++automation_lock = asyncio.Lock()
++
++async def execute_tool(func, *args, **kwargs):
++    """Run any tool function (sync or async) under the automation lock."""
++    target_func = func
++    if hasattr(func, "_func"):
++        target_func = func._func
++    elif hasattr(func, "__wrapped__"):
++        target_func = func.__wrapped__
++    async with automation_lock:
++        if asyncio.iscoroutinefunction(target_func):
++            return await target_func(*args, **kwargs)
++        else:
++            return await asyncio.get_running_loop().run_in_executor(
++                None, lambda: target_func(*args, **kwargs)
++            )
++
++async def speak_local(session: AgentSession, text: str):
++    """Speak a response using Gemini native audio (no SAPI, no COM, no CPU spike)."""
++    update_gui_status("Speaking...")
++    update_gui_response(text)
++    timer = get_or_create_timer()
++    timer.t9 = time.monotonic()
++    print(f"[T9] response started: '{text}'")
++    asyncio.create_task(_say_and_finish(session, text))
++
++async def _say_and_finish(session: AgentSession, text: str):
++    """Background task: speak via Gemini native TTS, then update GUI."""
++    print("[TTS] Gemini native audio started")
++    try:
++        await session.say(text)
++    except Exception as e:
++        print(f"[TTS] session.say() error: {e}")
++    timer = get_or_create_timer()
++    timer.t10 = time.monotonic()
++    print("[T10] response completed")
++    timer.print_perf()
++    update_gui_status("Listening...")
++    print("[TTS] Gemini native audio finished")
++
++# Context for desktop actions
++active_session = None
++background_loop = None
++latency_history = []
++desktop_context = {
++    "last_opened_app": None,
++    "last_referenced_file": None,
++}
++
++def send_text_command(command: str):
++    global background_loop, active_session
++    if background_loop and active_session:
++        asyncio.run_coroutine_threadsafe(
++            handle_user_transcript(active_session, command, source="text"),
++            background_loop
++        )
+ 
++async def wait_for_process(process_name: str, timeout: float = 3.0) -> bool:
++    import psutil
++    start_time = time.monotonic()
++    while time.monotonic() - start_time < timeout:
++        for proc in psutil.process_iter(['name']):
++            try:
++                if process_name.lower() in proc.info['name'].lower():
++                    return True
++            except (psutil.NoSuchProcess, psutil.AccessDenied):
++                pass
++        await asyncio.sleep(0.2)
++    return False
++
++async def route_command_directly(session: AgentSession, command: str) -> bool:
++    # Bypassing local router to ensure mj original smoothness and LLM tool processing
++    return False
++    clean_command = command.strip().lower()
++    clean_command = re.sub(r'^[,\.\?!\s]+|[,\.\?!\s]+$', '', clean_command).strip()
+     
+-    async def _analyze_if_needed(self):
+-        """Trigger visual analysis if conditions are met"""
+-        current_time = time.time()
++    if not clean_command:
++        return False
+         
+-        # Throttle analysis to avoid overwhelming the system
+-        if current_time - self._last_analysis_time < self._analysis_throttle:
+-            return
++    print(f"[ROUTER] Checking direct command: '{clean_command}'")
++    timer = get_or_create_timer()
++    
++    async def run_tool_helper(func, *args, **kwargs):
++        timer.t7 = time.monotonic()
++        print(f"[T7] tool started: {func.__name__}")
++        res = await execute_tool(func, *args, **kwargs)
++        timer.t8 = time.monotonic()
++        print(f"[T8] tool completed: {func.__name__}")
++        return res
++
++    # Strip conversational filler prefixes recursively
++    fillers = [
++        "could you please", "would you please", "can you please",
++        "could you", "would you", "can you", "please", "hey tony",
++        "for me", "for us", "me", "now", "immediately", "quickly", "fast",
++        "can my", "launch my", "open my", "start my", "run my", "my", "the"
++    ]
++    changed = True
++    while changed:
++        changed = False
++        for f in fillers:
++            if clean_command.startswith(f + " "):
++                clean_command = clean_command[len(f) + 1:].strip()
++                changed = True
++                break
++            elif clean_command.endswith(" " + f):
++                clean_command = clean_command[:-len(f) - 1].strip()
++                changed = True
++                break
++            elif clean_command == f:
++                clean_command = ""
++                changed = True
++                break
++
++    # 1. CHECK FOR MULTI-STEP COMMANDS
++    if any(sep in clean_command for sep in [" then ", " and ", ","]):
++        sub_cmds = []
++        parts = re.split(r'\b(?:and|then)\b|,', clean_command)
++        verbs = ["open", "launch", "start", "close", "exit", "set", "increase", "decrease", "take", "capture", "search", "play", "type", "press", "create", "find", "read", "summarize", "message"]
++        for p in parts:
++            p = p.strip()
++            if not p:
++                continue
++            if any(p.startswith(v) for v in verbs) or len(sub_cmds) == 0:
++                sub_cmds.append(p)
++            else:
++                if sub_cmds:
++                    sub_cmds[-1] += " " + p
++                    
++        if len(sub_cmds) > 1:
++            print(f"[ROUTER] Detected multi-step command. Split into: {sub_cmds}")
++            session.clear_user_turn()
++            for i, step in enumerate(sub_cmds):
++                print(f"[ROUTER] Executing step {i+1}: '{step}'")
++                handled = await route_command_directly(session, step)
++                if handled:
++                    if "open" in step or "launch" in step:
++                        await asyncio.sleep(1.0)
++                else:
++                    print(f"[ROUTER] Step {i+1} failed to route directly. Falling back to Gemini.")
++                    return False
++            await speak_local(session, "Multi task execution complete.")
++            return True
++
++    try:
++        # Greetings / Wake word response
++        if clean_command in ["hello", "hi", "hey", "hello tony", "hey tony", "tony", "yo"]:
++            print(f"[ROUTER] Direct command matched: greeting")
++            print(f"[ROUTER] intent: greeting")
++            session.clear_user_turn()
++            await speak_local(session, "Hello Boss.")
++            return True
++
++        # Time
++        if any(x in clean_command for x in ["what time is it", "current time", "what's the time", "tell me the time", "time"]):
++            now_str = datetime.now().strftime("%I:%M %p")
++            print(f"[ROUTER] Direct command matched: time -> {now_str}")
++            session.clear_user_turn()
++            await speak_local(session, f"It's {now_str}.")
++            return True
++
++        # Copy & Paste
++        if clean_command in ["copy", "copy this", "copy text", "copy that"]:
++            print("[ROUTER] Direct command matched: press_key(ctrl+c)")
++            session.clear_user_turn()
++            await run_tool_helper(press_key, "ctrl+c")
++            await speak_local(session, "Copied.")
++            return True
++
++        if clean_command in ["paste", "paste this", "paste text", "paste that"]:
++            print("[ROUTER] Direct command matched: press_key(ctrl+v)")
++            session.clear_user_turn()
++            await run_tool_helper(press_key, "ctrl+v")
++            await speak_local(session, "Pasted.")
++            return True
++
++        # Screenshot
++        if any(x in clean_command for x in ["take a screenshot", "screenshot", "capture my screen", "capture screen", "take a picture of my screen"]):
++            print("[ROUTER] Direct command matched: screen_short()")
++            session.clear_user_turn()
++            await run_tool_helper(screen_short)
++            await speak_local(session, "Screenshot taken.")
++            return True
++
++        # Folder shortcuts
++        if any(x in clean_command for x in ["open", "show", "display"]) and "downloads" in clean_command:
++            session.clear_user_turn()
++            dl_path = os.path.join(os.path.expanduser("~"), "Downloads")
++            await asyncio.get_running_loop().run_in_executor(None, os.startfile, dl_path)
++            await speak_local(session, "Opening Downloads.")
++            return True
+             
+-        async with self._analysis_lock:
+-            if self._is_analyzing:
+-                return
++        if any(x in clean_command for x in ["open", "show", "display"]) and "documents" in clean_command:
++            session.clear_user_turn()
++            doc_path = os.path.join(os.path.expanduser("~"), "Documents")
++            await asyncio.get_running_loop().run_in_executor(None, os.startfile, doc_path)
++            await speak_local(session, "Opening Documents.")
++            return True
++            
++        if any(x in clean_command for x in ["open", "show", "display"]) and "desktop" in clean_command:
++            session.clear_user_turn()
++            dt_path = os.path.join(os.path.expanduser("~"), "Desktop")
++            await asyncio.get_running_loop().run_in_executor(None, os.startfile, dt_path)
++            await speak_local(session, "Opening Desktop.")
++            return True
++
++        # Window Actions: Minimize / Maximize / Restore
++        if "minimize" in clean_command:
++            print(f"[ROUTER] Direct command matched: manage_window(minimize, active)")
++            session.clear_user_turn()
++            await run_tool_helper(manage_window, "minimize", "active")
++            await speak_local(session, "Minimizing window.")
++            return True
++
++        if "maximize" in clean_command:
++            print(f"[ROUTER] Direct command matched: manage_window(maximize, active)")
++            session.clear_user_turn()
++            await run_tool_helper(manage_window, "maximize", "active")
++            await speak_local(session, "Maximizing window.")
++            return True
++
++        if "restore" in clean_command:
++            print(f"[ROUTER] Direct command matched: manage_window(restore, active)")
++            session.clear_user_turn()
++            await run_tool_helper(manage_window, "restore", "active")
++            await speak_local(session, "Restoring window.")
++            return True
++
++        # Close Applications/Active window
++        if any(x in clean_command for x in ["close", "exit", "terminate", "quit"]):
++            close_target = None
++            if "chrome" in clean_command or "browser" in clean_command:
++                close_target = "chrome"
++            elif "whatsapp" in clean_command:
++                close_target = "whatsapp"
++            elif "spotify" in clean_command:
++                close_target = "spotify"
++            elif "vs code" in clean_command or "vscode" in clean_command or "code" in clean_command:
++                close_target = "code"
++            elif "notepad" in clean_command:
++                close_target = "notepad"
++            elif "calculator" in clean_command or "calc" in clean_command:
++                close_target = "calculator"
++            elif "excel" in clean_command:
++                close_target = "excel"
++            elif "word" in clean_command:
++                close_target = "word"
++            elif "explorer" in clean_command:
++                close_target = "explorer"
++            elif "task manager" in clean_command:
++                close_target = "task manager"
++            elif "paint" in clean_command:
++                close_target = "paint"
++            elif any(x in clean_command for x in ["window", "active", "this", "it", "current", "app", "application"]):
++                close_target = "active"
+                 
+-            self._is_analyzing = True
+-            try:
+-                # Get recent frames for analysis
+-                recent_frames = list(self._frame_buffer)[-self._max_frames_to_send:]
+-                if recent_frames:
+-                    await self._analyze_visual_scene(recent_frames)
+-            finally:
+-                self._is_analyzing = False
+-                self._last_analysis_time = current_time
+-
+-    async def _analyze_visual_scene(self, frames: list):
+-        """Analyze visual scene using the LLM"""
+-        try:
+-            # Convert frames to base64 for the LLM
+-            frame_contents = []
+-            for frame_data in frames:
+-                frame = frame_data['frame']
++            if close_target == "active" and desktop_context.get("last_opened_app"):
++                close_target = desktop_context["last_opened_app"]
+                 
+-                # Convert frame to image content
+-                image_content = await self._frame_to_image_content(frame)
+-                if image_content:
+-                    frame_contents.append(image_content)
+-            
+-            if frame_contents:
+-                # Create a chat context with the visual analysis
+-                visual_context = ChatContext()
+-                visual_context.add_message(
+-                    role="system",
+-                    content="Analyze the visual scene and provide a brief description."
+-                )
++            if close_target:
++                print(f"[ROUTER] Direct command matched: manage_window(close, {close_target})")
++                session.clear_user_turn()
++                await run_tool_helper(manage_window, "close", close_target)
++                await speak_local(session, f"Closing {close_target}.")
++                return True
++
++        # Open Applications
++        if any(x in clean_command for x in ["open", "launch", "run", "start", "show", "display"]):
++            open_target = None
++            if "chrome" in clean_command or "browser" in clean_command:
++                open_target = "chrome"
++            elif "whatsapp" in clean_command:
++                open_target = "whatsapp"
++            elif "spotify" in clean_command:
++                open_target = "spotify"
++            elif "vs code" in clean_command or "vscode" in clean_command or "code" in clean_command:
++                open_target = "vscode"
++            elif "notepad" in clean_command:
++                open_target = "notepad"
++            elif "calculator" in clean_command or "calc" in clean_command:
++                open_target = "calculator"
++            elif "excel" in clean_command:
++                open_target = "excel"
++            elif "word" in clean_command:
++                open_target = "word"
++            elif "explorer" in clean_command or "file explorer" in clean_command:
++                open_target = "explorer"
++            elif "task manager" in clean_command or "taskmgr" in clean_command:
++                open_target = "task manager"
++            elif "paint" in clean_command or "mspaint" in clean_command:
++                open_target = "paint"
++            elif "settings" in clean_command:
++                open_target = "settings"
+                 
+-                # Add image contents
+-                for img_content in frame_contents:
+-                    visual_context.add_message(
+-                        role="user",
+-                        content=[img_content]
+-                    )
++            if open_target:
++                print(f"[ROUTER] Direct command matched: open_app({open_target})")
++                session.clear_user_turn()
+                 
+-                # Generate analysis (you might want to modify this based on your LLM capabilities)
+-                if hasattr(self, '_activity') and self._activity:
+-                    # Use the activity to generate a response based on visual input
+-                    await self._activity.generate_reply(
+-                        chat_ctx=visual_context,
+-                        instructions="Analyze the visual scene and describe what you see."
+-                    )
+-                    
+-        except Exception as e:
+-            print(f"Visual analysis error: {str(e)}")
+-
+-    async def _frame_to_image_content(self, frame: rtc.VideoFrame) -> Optional[ImageContent]:
+-        """Convert VideoFrame to ImageContent for the LLM"""
+-        try:
+-            # Convert frame to base64
+-            if frame.type == VideoBufferType.RGBA:
+-                # Convert RGBA to JPEG for smaller size
+-                rgba_array = np.frombuffer(frame.data, dtype=np.uint8)
+-                rgba_array = rgba_array.reshape((frame.height, frame.width, 4))
++                if open_target == "spotify":
++                    await run_tool_helper(open_spotify)
++                    desktop_context["last_opened_app"] = "spotify"
++                    await speak_local(session, "Opening Spotify.")
++                else:
++                    await run_tool_helper(open_app, open_target)
++                    desktop_context["last_opened_app"] = open_target
++                    await speak_local(session, f"Opening {open_target.capitalize()}.")
++                return True
++
++        # Volume Controls
++        if any(x in clean_command for x in ["volume", "sound", "louder", "quieter", "mute", "unmute"]):
++            session.clear_user_turn()
++            if "mute" in clean_command and "unmute" not in clean_command:
++                await run_tool_helper(control_system_volume, "mute", 0)
++                await speak_local(session, "Volume muted.")
++                return True
++            elif "unmute" in clean_command:
++                await run_tool_helper(control_system_volume, "unmute", 50)
++                await speak_local(session, "Volume unmuted.")
++                return True
++            elif any(x in clean_command for x in ["up", "increase", "louder", "raise"]):
++                vol_info = await execute_tool(get_current_volume)
++                m = re.search(r'(\d+)%', vol_info)
++                curr_vol = int(m.group(1)) if m else 50
++                new_vol = min(curr_vol + 10, 100)
++                await run_tool_helper(control_system_volume, "set", new_vol)
++                await speak_local(session, "Volume increased.")
++                return True
++            elif any(x in clean_command for x in ["down", "decrease", "quieter", "reduce", "lower"]):
++                vol_info = await execute_tool(get_current_volume)
++                m = re.search(r'(\d+)%', vol_info)
++                curr_vol = int(m.group(1)) if m else 50
++                new_vol = max(curr_vol - 10, 0)
++                await run_tool_helper(control_system_volume, "set", new_vol)
++                await speak_local(session, "Volume decreased.")
++                return True
++            else:
++                m = re.search(r'(?:set\s+)?(?:volume|sound)\s+(?:to\s+)?(\d+)', clean_command)
++                if m:
++                    vol_level = int(m.group(1))
++                    await run_tool_helper(control_system_volume, "set", vol_level)
++                    await speak_local(session, f"Volume set to {vol_level} percent.")
++                    return True
++
++        # Brightness Controls
++        if "brightness" in clean_command or "brighter" in clean_command or "dimmer" in clean_command:
++            session.clear_user_turn()
++            import screen_brightness_control as sbc
++            try:
++                curr_bright = sbc.get_brightness()[0]
++            except:
++                curr_bright = 50
+                 
+-                # Convert to RGB (remove alpha channel)
+-                rgb_array = rgba_array[:, :, :3]
++            if "up" in clean_command or "increase" in clean_command or "brighter" in clean_command:
++                new_bright = min(curr_bright + 10, 100)
++                await run_tool_helper(control_screen_brightness, new_bright)
++                await speak_local(session, "Brightness increased.")
++                return True
++            elif "down" in clean_command or "decrease" in clean_command or "dimmer" in clean_command or "reduce" in clean_command:
++                new_bright = max(curr_bright - 10, 0)
++                await run_tool_helper(control_screen_brightness, new_bright)
++                await speak_local(session, "Brightness decreased.")
++                return True
++            else:
++                m = re.search(r'(?:set\s+)?brightness\s+(?:to\s+)?(\d+)', clean_command)
++                if m:
++                    bright_level = int(m.group(1))
++                    await run_tool_helper(control_screen_brightness, bright_level)
++                    await speak_local(session, f"Brightness set to {bright_level} percent.")
++                    return True
++
++        # Scroll
++        if "scroll" in clean_command:
++            direction = "down" if "down" in clean_command else "up"
++            m = re.search(r'(\d+)\s+times', clean_command)
++            times = int(m.group(1)) if m else 5
++            print(f"[ROUTER] Direct command matched: scroll_content({direction}, {times})")
++            session.clear_user_turn()
++            await run_tool_helper(scroll_content, direction, times)
++            await speak_local(session, f"Scrolled {direction}.")
++            return True
++
++        # Keyboard press commands
++        if "press" in clean_command or "hit" in clean_command:
++            key = None
++            if "enter" in clean_command:
++                key = "enter"
++            elif "escape" in clean_command or "esc" in clean_command:
++                key = "escape"
++            elif "tab" in clean_command:
++                key = "tab"
++            elif "space" in clean_command:
++                key = "space"
++            elif "backspace" in clean_command:
++                key = "backspace"
++            elif "delete" in clean_command:
++                key = "delete"
+                 
+-                # Encode as JPEG
+-                success, jpeg_data = cv2.imencode('.jpg', rgb_array)
+-                if success:
+-                    base64_data = base64.b64encode(jpeg_data.tobytes()).decode('utf-8')
+-                    return ImageContent(
+-                        type="image/jpeg",
+-                        data=base64_data
+-                    )
+-                    
+-        except Exception as e:
+-            print(f"Frame conversion error: {str(e)}")
+-        return None
+-
+-
++            if key:
++                print(f"[ROUTER] Direct command matched: press_key({key})")
++                session.clear_user_turn()
++                await run_tool_helper(press_key, key)
++                await speak_local(session, f"Pressed {key}.")
++                return True
++
++        # Folder Creation
++        folder_match = re.search(r'create\s+(?:a\s+)?folder\s+(?:called|named)\s+(.+)', clean_command)
++        if folder_match:
++            folder_name = folder_match.group(1).strip()
++            print(f"[ROUTER] Direct command matched: create_here({folder_name})")
++            session.clear_user_turn()
++            await run_tool_helper(create_here, folder_name, "folder")
++            await speak_local(session, f"Folder {folder_name} created.")
++            return True
++
++        # WhatsApp Messaging
++        wa_match = re.search(r'(?:message|whatsapp)\s+(\w+)\s+(?:saying|that)\s+(.+)', clean_command)
++        if wa_match:
++            name = wa_match.group(1)
++            msg = wa_match.group(2)
++            print(f"[ROUTER] Direct command matched: send_whatsapp_message({name}, {msg})")
++            session.clear_user_turn()
++            await run_tool_helper(send_whatsapp_message, name, msg)
++            await speak_local(session, f"Message sent to {name}.")
++            return True
++
++        # YouTube Media Searches
++        if "youtube" in clean_command:
++            query_match = re.search(r'(?:search|play)\s+youtube\s+for\s+(.+)', clean_command)
++            if not query_match:
++                query_match = re.search(r'play\s+(.+?)\s+on\s+youtube', clean_command)
++            if query_match:
++                query = query_match.group(1).strip()
++                print(f"[ROUTER] Direct command matched: play_media({query})")
++                session.clear_user_turn()
++                await run_tool_helper(play_media, query)
++                await speak_local(session, f"Playing {query} on YouTube.")
++                return True
++
++        # Spotify Playbacks
++        if "spotify" in clean_command or "music" in clean_command or "song" in clean_command or clean_command in ["play", "pause", "next", "previous", "skip", "go back"]:
++            session.clear_user_turn()
++            if "pause" in clean_command or "stop" in clean_command:
++                await run_tool_helper(spotify_pause)
++                await speak_local(session, "Music paused.")
++                return True
++            elif "play" in clean_command and "on spotify" not in clean_command:
++                await run_tool_helper(spotify_play)
++                await speak_local(session, "Resuming Spotify.")
++                return True
++            elif "next" in clean_command or "skip" in clean_command:
++                await run_tool_helper(spotify_next)
++                await speak_local(session, "Skipping song.")
++                return True
++            elif "previous" in clean_command or "go back" in clean_command:
++                await run_tool_helper(spotify_previous)
++                await speak_local(session, "Previous song.")
++                return True
++            else:
++                m = re.search(r'play\s+(.+?)\s+on\s+spotify', clean_command)
++                if m:
++                    song = m.group(1).strip()
++                    await run_tool_helper(spotify_play_song, song)
++                    await speak_local(session, f"Playing {song} on Spotify.")
++                    return True
++
++        # Excel Data Entry
++        excel_entry_match = re.search(r'(?:enter|write)\s+(.+?)\s+into\s+excel', clean_command)
++        if excel_entry_match:
++            data = excel_entry_match.group(1).strip()
++            print(f"[ROUTER] Direct command matched: enter_data_quick({data})")
++            session.clear_user_turn()
++            await speak_local(session, f"Entered {data} in Excel.")
++            return True
++
++        if any(x in clean_command for x in ["calculate total", "calculate the total", "calculate sum"]):
++            print("[ROUTER] Direct command matched: calculate_sum()")
++            session.clear_user_turn()
++            await run_tool_helper(calculate_sum)
++            await speak_local(session, "Sum calculated in Excel.")
++            return True
++
++        # PDF document interactions
++        pdf_match = re.search(r'(?:open|find)\s+(?:the\s+)?(.+?)\s+pdf', clean_command)
++        if pdf_match:
++            query = pdf_match.group(1).strip()
++            session.clear_user_turn()
++            path = find_and_open_file(query, "pdf")
++            if path:
++                desktop_context["last_referenced_file"] = path
++                await speak_local(session, f"Opening PDF: {os.path.basename(path)}.")
++            else:
++                await speak_local(session, f"Could not find PDF matching '{query}'.")
++            return True
++
++        # Read specific PDF page index
++        page_match = re.search(r'read\s+(?:the\s+)?(?:second|(\d+))(?:\s+page)?', clean_command)
++        if page_match:
++            page_num_str = page_match.group(1)
++            page_num = int(page_num_str) - 1 if page_num_str else 1
++            session.clear_user_turn()
++            pdf_path = desktop_context.get("last_referenced_file")
++            if pdf_path and pdf_path.lower().endswith(".pdf"):
++                text = extract_pdf_page(pdf_path, page_num)
++                print(f"[ROUTER] Extracted text from PDF page: '{text[:100]}...'")
++                await speak_local(session, f"Reading from PDF. {text[:300]}")
++            else:
++                await speak_local(session, "No active PDF document context found. Please open a PDF first.")
++            return True
++
++    except Exception as e:
++        print(f"[ROUTER] Error executing direct tool: {e}")
++        import traceback
++        traceback.print_exc()
++        session.clear_user_turn()
++        await speak_local(session, "Sorry, I encountered an error running that command.")
++        return True
++
++    return False
++
++# Local file search helpers
++def find_and_open_file(name_query, file_type="pdf"):
++    import os
++    dirs = [
++        os.path.join(os.path.expanduser("~"), "Downloads"),
++        os.path.join(os.path.expanduser("~"), "Documents"),
++        os.path.join(os.path.expanduser("~"), "Desktop"),
++        os.getcwd()
++    ]
++    # Check active explorer path
++    try:
++        ps_script = """
++        $shell = New-Object -ComObject Shell.Application
++        $windows = $shell.Windows()
++        foreach ($window in $windows) {
++            if ($window.FullName -like "*explorer.exe*") {
++                $path = $window.Document.Folder.Self.Path
++                if ($path) { return $path }
++            }
++        }
++        """
++        import subprocess
++        res = subprocess.run(['powershell', '-Command', ps_script], capture_output=True, text=True, timeout=2)
++        if res.returncode == 0 and res.stdout.strip():
++            explorer_path = res.stdout.strip()
++            if os.path.exists(explorer_path) and explorer_path not in dirs:
++                dirs.insert(0, explorer_path)
++    except:
++        pass
++        
++    for d in dirs:
++        if not os.path.exists(d):
++            continue
++        for root, _, files in os.walk(d):
++            if root.count(os.sep) - d.count(os.sep) > 1:
++                continue
++            for f in files:
++                if name_query.lower() in f.lower():
++                    if file_type == "pdf" and f.lower().endswith(".pdf"):
++                        path = os.path.join(root, f)
++                        try:
++                            os.startfile(path)
++                        except:
++                            import subprocess
++                            subprocess.Popen(["explorer", path])
++                        return path
++                    elif file_type == "any":
++                        path = os.path.join(root, f)
++                        try:
++                            os.startfile(path)
++                        except:
++                            import subprocess
++                            subprocess.Popen(["explorer", path])
++                        return path
++    return None
++
++def extract_pdf_page(file_path, page_num):
++    try:
++        import PyPDF2
++        with open(file_path, 'rb') as f:
++            reader = PyPDF2.PdfReader(f)
++            if page_num < len(reader.pages):
++                page = reader.pages[page_num]
++                return page.extract_text() or "(No text could be extracted from this page)"
++            else:
++                return f"Page {page_num+1} out of range. The document has {len(reader.pages)} pages."
++    except Exception as e:
++        return f"Could not read PDF page: {e}"
+ 
++def reset_active_timeout(session):
+     
++    if _runtime_state['active_timeout_task']:
++        _runtime_state['active_timeout_task'].cancel()
++    
++    async def timeout_coro():
++        await asyncio.sleep(8)
++        
++        if _runtime_state['is_active']:
++            print("[ROUTER] Active listening timeout. Deactivating...")
++            _runtime_state['is_active'] = False
++            update_gui_status("Listening...")
++            
++    _runtime_state['active_timeout_task'] = asyncio.create_task(timeout_coro())
+ 
++_runtime_state['is_processing'] = False
+ 
+-    def _trigger_gui_effect(self):
+-        # This will be called by the plugin system
+-        pass  # Implementation in nova_gui.py
+-
+-    def _initialize_tools(self, tools: List[Any]) -> List[Any]:
+-        """Validate and initialize tools with proper error handling."""
+-        validated_tools = []
+-        for tool in tools:
+-            try:
+-                if not callable(tool):
+-                    raise ValueError(f"Tool {getattr(tool, '__name__', str(tool))} is not callable")
+-                if not tool.__doc__:
+-                    print(f"⚠️ Warning: Tool {tool.__name__} missing docstring")
+-                
+-                # Add tool description metadata
+-                tool.metadata = {
+-                    'description': tool.__doc__.strip() if tool.__doc__ else f"Tool: {tool.__name__}",
+-                    'last_used': None,
+-                    'usage_count': 0
+-                }
+-                validated_tools.append(tool)
+-                print(f"✅ Initialized tool: {tool.__name__}")
+-            except Exception as e:
+-                print(f"⚠️ Failed to initialize tool {getattr(tool, '__name__', str(tool))}: {str(e)}")
++async def handle_user_transcript(session: AgentSession, transcript: str, source: str = "voice"):
++    
++    
++    if _runtime_state['is_processing']:
++        print(f"[ROUTER] Command already in progress, ignoring extra transcript ({source}).")
++        session.clear_user_turn()
++        return
++
++    clean_text = transcript.strip().lower()
++    print(f"[ROUTER] received ({source}): '{clean_text}'")
++    print(f"[VOICE] User speech transcript: '{clean_text}' (state={_runtime_state['state'].value})")
++    
++    # Record T4
++    timer = get_or_create_timer()
++    timer.t4 = time.monotonic()
++    print("[T4] command router started")
++    
++    # Auto-activate on any voice speech or text command
++    if source == "voice" and not _runtime_state['is_active']:
++        _runtime_state['is_active'] = True
++        _runtime_state["state"] = TonyState.LISTENING
++        
++    # We are active or this is text input, process the command!
++    if _runtime_state['active_timeout_task']:
++        _runtime_state['active_timeout_task'].cancel()
+         
+-        print(f"📋 Total tools initialized: {len(validated_tools)}")
+-        return validated_tools
++    update_gui_status("Executing...")
++    _runtime_state['is_processing'] = True
++    forwarded_to_llm = False
++    
++    try:
++        handled = await route_command_directly(session, clean_text)
++        if handled:
++            print("[ROUTER] Direct command handled")
++            session.clear_user_turn()
++            _runtime_state["state"] = TonyState.IDLE
++            _runtime_state['is_active'] = False
++            update_gui_status("Listening...")
++            
++            # Reset wake word detector cooldown since we handled a command quickly
++            if _runtime_state["wake_detector"]:
++                _runtime_state["wake_detector"].reset_cooldown()
++        else:
++            print("[ROUTER] Direct routing failed, forwarding to LLM")
++            _runtime_state["state"] = TonyState.PROCESSING
++            update_gui_status("Processing...")
++            await session.commit_user_turn()
++            forwarded_to_llm = True
++            timer.t5 = time.monotonic()
++            print("[T5] LLM request started")
++    except Exception as e:
++        print(f"[ROUTER] Error routing direct command: {e}")
++        _runtime_state["state"] = TonyState.IDLE
++        _runtime_state['is_active'] = False
++        update_gui_status("Listening...")
++    finally:
++        if not forwarded_to_llm:
++            _runtime_state['is_processing'] = False
++
++def _init_llm_from_mj_original():
++    if network_available:
++        print("🧠 Initializing Gemini Realtime LLM (imported from MJ_original)...")
++        # Copied exact RealtimeModel configuration from MJ_original folder
++        return RealtimeModel(
++            voice="Aoede",
++            temperature=0.5,
++            top_p=0.9,
++        )
++    else:
++        raise ValueError("RealtimeModel not available. Network issue.")
++
++# =========================
++# MAIN AGENT
++# =========================
++class UltimateAdvancedTony(Agent):
++    def __init__(self):
++        import tools
++        tools.assistant_instance = self
++        self._reminders: Dict[str, Dict[str, Any]] = {}
++        self._reminder_task: Optional[asyncio.Task] = None
++        self._session: Optional[AgentSession] = None
++        self._reminder_counter = 0
++        self._scheduled_tasks: Dict[str, Dict[str, Any]] = {}
++        self._scheduler_task: Optional[asyncio.Task] = None
++        self._task_counter = 0
++
++        _base_tools = [
++            search_web,
++            get_time_info,
++            open_app,
++            get_weather,
++            manage_window,
++            list_windows,
++            play_media,
++            press_key,
++            write_in_notepad,
++            desktop_control,
++            scroll_content,
++            send_whatsapp_message,
++            use_smart_clipboard,
++            universal_file_opener,
++            system_power_action,
++            get_top_news,
++            type_user_message_auto,
++            control_system_volume,
++            control_screen_brightness,
++            set_reminder,
++            view_reminders,
++            cancel_reminder,
++            get_current_volume,
++            get_system_status,
++        ]
++        # New tools from mj original — only add if successfully imported
++        _new_tools = [
++            open_spotify, spotify_next, spotify_previous,
++            spotify_play_song, spotify_play_liked, spotify_pause,
++            generate_ai_image,
++            scan_system_for_viruses,
++            execute_multi_task,
++            send_media_to_whatsapp,
++            word_to_pdf, excel_to_pdf, ppt_to_pdf, image_to_pdf, convert_image_format,
++            create_here,
++        ]
++        tools = _base_tools + [t for t in _new_tools if t is not None]
+ 
++        super().__init__(
++            instructions=self._build_instructions(),
++            tools=tools,
++            llm=self._init_llm(),
++        )
+ 
++        print(f"[OK] Tony initialized with {len(tools)} tools")
+ 
+-    def _build_instructions(self) -> str:
+-        """Construct the complete instruction set for the agent."""
+-        tool_descriptions = []
+-        for tool in self._tools:
+-            tool_name = tool.__name__
+-            tool_doc = tool.__doc__ if tool.__doc__ else "No description available"
+-            tool_descriptions.append(f"- {tool_name}: {tool_doc.strip()}")
+-        
+-        available_tools = "\n".join(tool_descriptions)
+-        
++    def _init_llm(self):
++        return _init_llm_from_mj_original()
++
++    def _build_instructions(self):
+         return "\n".join([
+             AGENT_INSTRUCTION,
+-            SESSION_INSTRUCTION,
+             AGENT_INSTRUCTION_FOR_TOOLS,
+-            "You are a multilingual assistant capable of understanding and responding in multiple languages.",
+-            f"\nAvailable tools:\n{available_tools}",
+-            "\nWhen a user request requires tool usage, actively use the appropriate tool and provide feedback about the action taken."
++            "You have access to ALL system, voice, automation and reminder tools.",
++            "Use tools aggressively when required.",
+         ])
+ 
+-    async def on_tool_call_start(self, tool_call):
+-        """Handle tool call start event."""
+-        print(f"🔧 Starting tool call: {tool_call.function_info.name}")
+-        self._last_tool_used = tool_call.function_info.name
+-        return await super().on_tool_call_start(tool_call)
++    # =========================
++    # REMINDER SYSTEM
++    # =========================
++    def set_session(self, session: AgentSession):
++        self._session = session
++        print("🔔 Session linked for reminders")
+ 
+-    async def on_tool_call_end(self, tool_call, result):
+-        """Handle tool call completion."""
+-        success = result and not isinstance(result, Exception)
+-        self._last_tool_success = success
+-        
+-        print(f"🔧 Tool call completed: {tool_call.function_info.name} - {'✅ Success' if success else '❌ Failed'}")
+-        if not success and result:
+-            print(f"   Error: {result}")
+-        
+-        return await super().on_tool_call_end(tool_call, result)
+-
+-    async def on_user_turn_completed(self, turn_ctx, new_message):
+-        """Handle post-processing after user turn completion."""
+-        user_message = turn_ctx.user_message.text_content if turn_ctx.user_message else "[no user input]"
+-        assistant_message = new_message.text_content if new_message else "[no assistant reply]"
+-
+-        # Log conversation
+-        print(f"\n🗣️ USER: {user_message}")
+-        print(f"🤖 ASSISTANT: {assistant_message}")
+-        await self._log_conversation("User", user_message)
+-        await self._log_conversation("Assistant", assistant_message)
+-
+-        # Update tool usage tracking
+-        if self._last_tool_used:
+-            for tool in self._tools:
+-                if tool.__name__ == self._last_tool_used:
+-                    tool.metadata['last_used'] = datetime.now()
+-                    tool.metadata['usage_count'] += 1
+-                    break
+-
+-        return await super().on_user_turn_completed(turn_ctx, new_message)
+-
+-    async def _log_conversation(self, sender: str, message: str) -> None:
+-        """Log conversation to file with proper encoding and error handling."""
+-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+-        try:
+-            with open(self._chat_log_path, "a", encoding="utf-8") as f:
+-                f.write(f"[{timestamp}] {sender}: {message}\n")
+-        except IOError as e:
+-            print(f"⚠️ Failed to log conversation: {str(e)}")
++    def add_reminder(self, reminder_text: str, reminder_time: datetime, reminder_type: str = "message"):
++        rid = f"rem_{self._reminder_counter}"
++        self._reminder_counter += 1
+ 
+-    async def _check_reminders(self) -> None:
+-        """Check and announce any reminders."""
+-        try:
+-            # Fix: Add await keyword here since get_today_reminder_message_from_db is async
+-            reminder_text = await get_today_reminder_message_from_db()
+-            if reminder_text:
+-                await say_reminder(reminder_text)
+-        except Exception as e:
+-            print(f"⚠️ Failed to check reminders: {str(e)}")
++        self._reminders[rid] = {
++            "text": reminder_text,
++            "time": reminder_time,
++        }
+ 
++        if not self._reminder_task or self._reminder_task.done():
++            self._reminder_task = asyncio.create_task(self._monitor_reminders())
+ 
+-# In your Assistant class
++        return rid
+ 
+-    # In your Assistant class
++    def get_reminders(self):
++        return {
++            rid: {
++                "reminder_text": data["text"],
++                "reminder_time": data["time"]
++            }
++            for rid, data in self._reminders.items()
++        }
+ 
+-    async def generate_startup_message(self, session: AgentSession):
+-        """
+-        Dynamically constructs startup instructions by combining the base SESSION_INSTRUCTION
+-        with a summary of the last conversation, then generates a context-aware greeting.
+-        """
+-        try:
+-            # It's good practice to import DB functions inside the method that uses them.
+-            from nova_db import get_last_n_messages 
+-            import json # Ensure json is imported
++    def cancel_reminder(self, reminder_id: str) -> bool:
++        if reminder_id in self._reminders:
++            self._reminders.pop(reminder_id)
++            return True
++        return False
+ 
+-            # Start with the base instructions you've already written.
+-            final_instructions = SESSION_INSTRUCTION
+-            
+-            # Fetch the last 4 messages for context.
+-            last_messages = get_last_n_messages(n=4)
++    async def _monitor_reminders(self):
++        print("⏰ Reminder monitor running")
++        while self._reminders:
++            now = datetime.now()
++            triggered = []
+ 
+-            if last_messages:
+-                print("✅ Found recent messages. Adding conversational context to startup instructions.")
+-                
+-                # Format the last messages into a clean, readable summary.
+-                # This handles potential JSON errors gracefully.
+-                summary_lines = []
+-                for msg in last_messages:
+-                    try:
+-                        content = json.loads(msg[1])[0]
+-                        summary_lines.append(f"- {msg[0]}: {content}")
+-                    except (json.JSONDecodeError, IndexError):
+-                        continue # Skip malformed messages
+-                
+-                last_convo_summary = "\n".join(summary_lines)
+-
+-                # Append the new, dynamic instructions to the existing ones.
+-                final_instructions = (
+-                    "\n\n"
+-                    "🔰 विशेष संदर्भ:\n"
+-                    "यह हमारी पिछली बातचीत का अंतिम अंश है। कृपया इसका उपयोग करके अपना अभिवादन व्यक्तिगत और प्रासंगिक बनाएं।\n"
+-                    "उदाहरण: यदि अंतिम संदेश कॉलेज जाने के बारे में था, तो आप कह सकते हैं, 'नमस्कार अंकित सर, कॉलेज से वापस स्वागत है! आपका दिन कैसा रहा?'\n\n"
+-                    "--- पिछली बातचीत का अंत ---\n"
+-                    f"{last_convo_summary}\n"
+-                    "--------------------------"
+-                )
+-            else:
+-                # If there's no history, we don't need to add anything.
+-                # The base SESSION_INSTRUCTION is sufficient for a first-time greeting.
+-                print("✅ No message history found. Using standard startup instructions.")
++            for rid, data in self._reminders.items():
++                if now >= data["time"]:
++                    await self._trigger_reminder(data["text"])
++                    triggered.append(rid)
+ 
+-            # Use the final, combined instructions to generate the spoken reply.
+-            await session.generate_reply(instructions=SESSION_INSTRUCTION)
++            for rid in triggered:
++                self._reminders.pop(rid, None)
+ 
+-        except Exception as e:
+-            print(f"⚠️ Failed to generate startup message: {e}")
+-            # Fallback to a simple greeting if there's an error.
+-            await session.generate_reply(instructions="नमस्कार सर, मैं आपकी सेवा में प्रस्तुत हूँ।")
++            await asyncio.sleep(5)
+ 
++    async def _trigger_reminder(self, text: str):
++        if self._session:
++            await self._session.generate_reply(
++                instructions=f"Reminder: {text}"
++            )
++            print(f"🔔 Reminder sent → {text}")
++
++    # =========================
++    # TASK SCHEDULER SYSTEM
++    # =========================
++    def add_scheduled_task(self, task_description: str, schedule_time: datetime, tool_name: str, tool_parameters: str = ""):
++        tid = f"task_{self._task_counter}"
++        self._task_counter += 1
++
++        self._scheduled_tasks[tid] = {
++            "task_description": task_description,
++            "schedule_time": schedule_time,
++            "tool_name": tool_name,
++            "tool_parameters": tool_parameters,
++        }
+ 
++        if not self._scheduler_task or self._scheduler_task.done():
++            self._scheduler_task = asyncio.create_task(self._monitor_scheduled_tasks())
+ 
++        return tid
+ 
++    def get_scheduled_tasks(self):
++        return self._scheduled_tasks
+ 
++    def cancel_scheduled_task(self, task_id: str) -> bool:
++        if task_id in self._scheduled_tasks:
++            self._scheduled_tasks.pop(task_id)
++            return True
++        return False
+ 
++    async def _monitor_scheduled_tasks(self):
++        print("⏰ Scheduler monitor running")
++        while self._scheduled_tasks:
++            now = datetime.now()
++            triggered = []
+ 
++            for tid, data in list(self._scheduled_tasks.items()):
++                if now >= data["schedule_time"]:
++                    await self._execute_scheduled_task(data)
++                    triggered.append(tid)
+ 
+-async def entrypoint(ctx: agents.JobContext):
+-    """Main entry point for the agent with retry logic."""
+-    max_retries = 3
+-    retry_delay = 5
+-    
+-    for attempt in range(1, max_retries + 1):
+-        try:
+-            # Create agent first
+-            agent = Assistant()
+-            
+-            # Create session with the agent
+-            session = AgentSession()
++            for tid in triggered:
++                self._scheduled_tasks.pop(tid, None)
+ 
+-            # Start session with proper configuration
+-            try:
+-                await asyncio.wait_for(
+-                    session.start(
+-                        room=ctx.room,
+-                        agent=agent,
+-                        room_input_options=RoomInputOptions(
+-                            video_enabled=True,
+-                            noise_cancellation=noise_cancellation.BVC(),
+-                        ),
+-                    ),
+-                    timeout=30.0
+-                )
+-            except asyncio.TimeoutError:
+-                raise Exception("Connection timeout")
+-            
+-            # Connect to the room
+-            await ctx.connect()
+-            
+-            # ==================================================
+-            # START: MODIFIED BLOCK
+-            # ==================================================
+-            
+-            # Instead of sending a generic instruction, call our new method.
+-            # This will handle the startup message generation.
+-            await session.generate_reply(instructions=SESSION_INSTRUCTION)
+-            
+-            # ==================================================
+-            # END: MODIFIED BLOCK
+-            # ==================================================
+-            
+-            # Check for reminders (this can stay here)
+-            await agent._check_reminders()
++            await asyncio.sleep(5)
++
++    async def _execute_scheduled_task(self, task_data: dict):
++        tool_name = task_data["tool_name"]
++        params = task_data["tool_parameters"]
++        desc = task_data["task_description"]
++        print(f"🚀 Executing scheduled task: {desc} ({tool_name})")
++        
++        try:
++            # Map tools dynamically from already imported functions
++            tool_mapping = {
++                "open_app": open_app,
++                "search_web": search_web,
++                "send_whatsapp_message": send_whatsapp_message,
++                "control_system_volume": control_system_volume,
++                "control_screen_brightness": control_screen_brightness,
++                "play_media": play_media,
++                "write_in_notepad": write_in_notepad,
++            }
+             
+-            print("✅ Agent session started successfully and is now live.")
+-            break
++            if tool_name in tool_mapping:
++                fn = tool_mapping[tool_name]
++                if asyncio.iscoroutinefunction(fn):
++                    import inspect
++                    sig = inspect.signature(fn)
++                    if len(sig.parameters) > 0:
++                        res = await fn(params)
++                    else:
++                        res = await fn()
++                else:
++                    import inspect
++                    sig = inspect.signature(fn)
++                    if len(sig.parameters) > 0:
++                        res = fn(params)
++                    else:
++                        res = fn()
++                msg = f"Scheduled task executed successfully: {res}"
++            else:
++                msg = f"Scheduled task triggered, but tool '{tool_name}' is not dispatchable."
+             
++            await self._trigger_reminder(msg)
+         except Exception as e:
+-            print(f"❌ Entrypoint failed on attempt {attempt}: {e}")
+-            if attempt < max_retries:
+-                await asyncio.sleep(retry_delay)
+-            else:
+-                raise  # Re-raise if all retries failed
++            print(f"[ERROR] Error executing scheduled task: {e}")
++            await self._trigger_reminder(f"Failed to execute scheduled task '{desc}': {e}")
+ 
+-# async def entrypoint(ctx: agents.JobContext):
+-#     """Main entry point for the agent"""
+-#     try:
+-#         print("🎯 Agent entrypoint starting...")
+-        
+-#         # Wait for room to be ready
+-#         await ctx.connect()
+-#         print("✅ Connected to LiveKit room")
+-        
+-#         # Create VideoSource FIRST
+-#         from livekit.rtc import VideoSource
+-#         video_source = VideoSource(640, 480)
+-#         print("✅ VideoSource created")
+-        
+-#         # Create and publish video track
+-#         video_track = rtc.LocalVideoTrack.create_video_track("camera", video_source)
+-#         publication = await ctx.room.local_participant.publish_track(video_track)
+-#         print(f"✅ Camera video track published: {publication.sid}")
+-        
+-#         # IMPORTANT: Set video source in GUI BEFORE creating agent
+-#         print("🔄 Setting video source in GUI...")
+-#         max_retries = 10
+-#         for attempt in range(max_retries):
+-#             try:
+-#                 import __main__
+-#                 if hasattr(__main__, 'nova_window'):
+-#                     # Use QTimer to ensure GUI thread safety
+-#                     from PyQt5.QtCore import QTimer
+-#                     from PyQt5.QtWidgets import QApplication
+-                    
+-#                     def set_video_track_in_gui():
+-#                         try:
+-#                             if (hasattr(__main__.nova_window, 'nova_widget') and 
+-#                                 hasattr(__main__.nova_window.nova_widget, 'right_panel')):
+-                                
+-#                                 __main__.nova_window.nova_widget.right_panel.set_video_track(video_source)
+-#                                 print("✅ Video source successfully set in GUI right panel")
+-                                
+-#                                 # Verify it was set
+-#                                 if hasattr(__main__.nova_window.nova_widget.right_panel, '_video_source'):
+-#                                     vs = __main__.nova_window.nova_widget.right_panel._video_source
+-#                                     print(f"✅ Video source verification: {vs is not None}")
+-#                                 else:
+-#                                     print("❌ Video source not found in right panel")
+-#                             else:
+-#                                 print("❌ Right panel not accessible")
+-#                         except Exception as e:
+-#                             print(f"❌ Error setting video source in GUI: {e}")
+-                    
+-#                     # Execute in GUI thread
+-#                     QTimer.singleShot(0, set_video_track_in_gui)
+-                    
+-#                     # Process events to ensure the timer fires
+-#                     QApplication.processEvents()
+-#                     await asyncio.sleep(0.5)  # Give time for GUI update
+-#                     break
+-                    
+-#             except Exception as e:
+-#                 print(f"⚠️ Attempt {attempt + 1} to set video track failed: {e}")
+-#                 if attempt < max_retries - 1:
+-#                     await asyncio.sleep(0.5)
+-#                 else:
+-#                     print("❌ Failed to set video source in GUI after all retries")
+-        
+-#         # Now create agent and session
+-#         print("🤖 Creating assistant agent...")
+-#         agent = Assistant()
+-#         session = AgentSession()
+-        
+-#         print("🚀 Starting agent session...")
+-#         await session.start(
+-#             room=ctx.room,
+-#             agent=agent,
+-#             room_input_options=RoomInputOptions(
+-#                 video_enabled=True,
+-#                 noise_cancellation=noise_cancellation.BVC(),
+-#             ),
+-#         )
+-#         print("✅ Session started")
+-        
+-#         # Set assistant reference in main window
+-#         if hasattr(__main__, 'nova_window'):
+-#             def set_assistant_in_gui():
+-#                 __main__.nova_window.set_assistant(agent)
+-#                 print("✅ Assistant reference set in main window")
+-#             QTimer.singleShot(0, set_assistant_in_gui)
+-        
+-#         # Generate startup message
+-#         print("💬 Generating startup message...")
+-#         await session.generate_reply(instructions=SESSION_INSTRUCTION)
+-#         print("✅ Startup message sent")
+-        
+-#         print("🎉 Agent is now fully operational with camera!")
+-        
+-#         # Send a test frame immediately
+-#         if video_source:
+-#             def send_test_frame():
+-#                 try:
+-#                     # Create a colored test frame
+-#                     test_frame_data = np.zeros((480, 640, 4), dtype=np.uint8)
+-#                     test_frame_data[:, :, 0] = 255  # Blue channel
+-#                     test_frame_data[:, :, 3] = 255  # Alpha channel
+-                    
+-#                     test_frame = rtc.VideoFrame(
+-#                         width=640,
+-#                         height=480,
+-#                         type=VideoBufferType.RGBA,
+-#                         data=test_frame_data.tobytes()
+-#                     )
+-#                     video_source.capture_frame(test_frame)
+-#                     print("🎨 Test frame sent to LiveKit")
+-#                 except Exception as e:
+-#                     print(f"❌ Test frame failed: {e}")
++# =========================
++# ENTRYPOINT
++# =========================
++async def entrypoint(ctx: agents.JobContext):
++    global active_session, background_loop, active_room, worker_loop
++    
++
++    # Ignore handshake-room job assignments
++    if ctx.room.name == "handshake-room":
++        print("[JOB] REJECTED — handshake-room")
++        return
++
++    # Enforce SINGLETON runtime safely across threads
++    with _singleton_lock:
++        if _runtime_state["tony_instance"] is not None:
++            print("[JOB] REJECTED_DUPLICATE — Tony already running")
++            return
++
++        print("[JOB] ACCEPTED — Starting Tony...")
++        _runtime_state["state"] = TonyState.BOOTING
++
++        active_room = ctx.room
++        worker_loop = asyncio.get_running_loop()
++        setup_rpc_proxies()
++
++        update_gui_connection("LiveKit: Connecting... | Gemini: Connecting")
++        update_gui_status("Booting...")
++
++        # Instantiate Tony agent (creates VAD internally)
++        agent = UltimateAdvancedTony()
++        _runtime_state["tony_instance"] = agent
++
++        # Create AgentSession — default auto mode (Google-like smooth endpointing)
++        # Using fast endpointing to reduce latency
++        session = AgentSession(
++            min_endpointing_delay=0.5,
++            max_endpointing_delay=1.0,
++        )
++        _runtime_state["session"] = session
++        active_session = session
++
++    print("[JOB] CREATED — Pipeline initializing")
++    background_loop = worker_loop
++
++    # Start health snapshot (lightweight, no gc scanning)
++    # _health_task = asyncio.create_task(_health_snapshot_loop())
++
++
++
++    # ---- Session event handlers ----
++    @session.on("user_state_changed")
++    def on_user_state_changed(ev: agents.voice.UserStateChangedEvent):
++        timer = get_or_create_timer()
++        if ev.new_state == "speaking":
++            reset_timer()
++            timer = get_or_create_timer()
++            timer.t1 = time.monotonic()
++            print("[T1] speech started")
++            print("[VAD] speech detected")
++            if _runtime_state["state"] in (TonyState.IDLE, TonyState.WAKE_DETECTED, TonyState.LISTENING):
++                update_gui_status("Speech Detected")
++            # INTERRUPTION: If TONY is currently speaking, stop it
++        elif ev.new_state == "idle":
++            timer.t2 = time.monotonic()
++            print("[T2] speech ended")
++            print("[VAD] speech ended")
++            if _runtime_state["state"] == TonyState.LISTENING:
++                update_gui_status("Transcribing...")
++
++    @session.on("user_input_transcribed")
++    def on_user_transcript(ev: agents.voice.UserInputTranscribedEvent):
++        if ev.transcript.strip():
++            # Stream partial/final transcript into a single bubble
++            update_gui_partial_transcript(ev.transcript, ev.is_final)
++            if ev.is_final:
++                timer = get_or_create_timer()
++                timer.t3 = time.monotonic()
++                timer.command = ev.transcript
++                print(f"[T3] transcript received: '{ev.transcript}'")
++                print(f"[STT] transcript received: {ev.transcript}")
++                asyncio.create_task(handle_user_transcript(session, ev.transcript))
++
++    @session.on("agent_state_changed")
++    def on_agent_state(ev: agents.voice.AgentStateChangedEvent):
++        print(f"[AGENT] State changed: {ev.old_state} -> {ev.new_state}")
++        timer = get_or_create_timer()
++
++        if ev.new_state == "listening":
++            if _runtime_state["state"] not in (TonyState.WAKE_DETECTED, TonyState.LISTENING):
++                _runtime_state["state"] = TonyState.IDLE
++            update_gui_status("Listening...")
++        elif ev.new_state == "thinking":
++            _runtime_state["state"] = TonyState.PROCESSING
++            update_gui_status("Thinking...")
++            timer.t5 = time.monotonic()
++            print("[T5] LLM request started")
++        elif ev.new_state == "speaking":
++            _runtime_state["state"] = TonyState.SPEAKING
++            update_gui_status("Speaking...")
+             
+-#             QTimer.singleShot(1000, send_test_frame)
+-        
+-#         # Keep the agent running
+-#         while True:
+-#             await asyncio.sleep(1)
++            # Flush buffered text to GUI synchronously with speech
++            pending_text = _runtime_state.get("pending_llm_text", "")
++            if pending_text:
++                update_gui_response(pending_text)
++                _runtime_state["pending_llm_text"] = ""
++                
++            timer.t6 = time.monotonic()
++            timer.t9 = time.monotonic()
++            print("[T6] LLM response received")
++            print("[T9] response started")
++        elif ev.new_state == "idle":
++            _runtime_state["state"] = TonyState.IDLE
++            update_gui_status("Listening...")
++            # Ensure agent goes back to sleep after Gemini responds
+             
+-#     except Exception as e:
+-#         print(f"❌ Entrypoint error: {e}")
+-#         import traceback
+-#         traceback.print_exc()
+-#         raise
++            _runtime_state['is_active'] = False
++            _runtime_state['is_processing'] = False
++
++        # Log response completed when transitioning out of speaking
++        if ev.old_state == "speaking" and ev.new_state != "speaking":
++            timer.t10 = time.monotonic()
++            print("[T10] response completed")
++            timer.print_perf()
++
++    @session.on("conversation_item_added")
++    def on_convo_item(ev: agents.voice.ConversationItemAddedEvent):
++        if hasattr(ev.item, "role") and ev.item.role == "assistant":
++            text = ""
++            if hasattr(ev.item, "content"):
++                content = ev.item.content
++                if isinstance(content, str):
++                    text = content
++                elif isinstance(content, list):
++                    texts = []
++                    for block in content:
++                        if isinstance(block, str):
++                            texts.append(block)
++                        elif hasattr(block, "text"):
++                            texts.append(block.text)
++                        elif isinstance(block, dict) and "text" in block:
++                            texts.append(block["text"])
++                    text = " ".join(texts)
++            if text:
++                _runtime_state["pending_llm_text"] = text
++                # DO NOT UPDATE GUI YET. Wait for "speaking" state to sync with audio.
++
++    @session.on("close")
++    def on_session_close(ev: agents.voice.CloseEvent):
++        _runtime_state["state"] = TonyState.OFFLINE
++        update_gui_connection("LiveKit: Disconnected | Gemini: Offline")
++        update_gui_status("Offline")
++
++    # ---- Start session ----
++    try:
++        await session.start(
++            room=ctx.room,
++            agent=agent,
++            room_input_options=RoomInputOptions(
++                video_enabled=False,
++            ),
++        )
++
++        # Record T0
++        timer = get_or_create_timer()
++        timer.t0 = time.monotonic()
++        print("[T0] microphone detected")
++
++        agent.set_session(session)
++
++        await ctx.connect()
++        update_gui_connection("LiveKit: Connected | Gemini: Active")
++
++
++
++        _runtime_state["state"] = TonyState.IDLE
++        update_gui_status("Listening...")
++
++        # Load conversation history into GUI (non-blocking)
++        asyncio.create_task(_load_history_to_gui())
++
++        # Start session health monitor for 2-hour sessions
++        # asyncio.create_task(_session_health_monitor())
++
++        await session.generate_reply(instructions=SESSION_INSTRUCTION)
++        print("[INFO] Tony is LIVE & READY")
++    except Exception as conn_err:
++        print(f"[ERROR] LiveKit session start failed: {conn_err}")
++        import traceback
++        traceback.print_exc()
++        _runtime_state["state"] = TonyState.ERROR
++        update_gui_connection(f"Error: {str(conn_err)[:35]}")
++        update_gui_status("Offline")
++        return
++
++    # ---- Keep alive ----
++    try:
++        await asyncio.Future()
++    except asyncio.CancelledError:
++        print("[JOB] CANCELLED")
++    finally:
++        print("[INFO] Shutting down Tony pipeline resources...")
++        _runtime_state["state"] = TonyState.SHUTTING_DOWN
++
++
++
++        # Cancel health snapshot
++        if _health_task and not _health_task.done():
++            _health_task.cancel()
++
++        # Close session
++        if _runtime_state["session"]:
++            try:
++                await _runtime_state["session"].aclose()
++            except Exception:
++                pass
++
++        # Reset all runtime state
++        _runtime_state["tony_instance"] = None
++        _runtime_state["session"] = None
++        _runtime_state["vad"] = None
++        _runtime_state["consumer_task"] = None
++        _runtime_state["wake_detector"] = None
++        _runtime_state["mic_capture"] = None
++        _runtime_state["state"] = TonyState.OFFLINE
++        active_session = None
++        _runtime_state['is_active'] = False
++        _runtime_state['is_processing'] = False
++
++        print("[JOB] CLOSED — Pipeline stopped")
++
++
++
++async def _load_history_to_gui():
++    """Load recent conversation history from SQLite DB into GUI chat bubbles."""
++    try:
++        await asyncio.sleep(1.5)  # Small delay — let GUI settle first
++        from memory_db import MemoryDatabase
++        db = MemoryDatabase()
++        history = db.get_conversation_history(limit=20)
++        if not history:
++            return
++        print(f"[HISTORY] Loading {len(history)} conversation turns into GUI")
++        # history is newest-first; reverse for chronological display
++        cb = _gui_callbacks.get('add_static_bubble')
++        if not cb:
++            return
++        for conv in reversed(history):
++            sender = "You" if conv.role == "user" else "TONY"
++            content = conv.content.strip()
++            if content:
++                try:
++                    cb(sender, content[:250])
++                    await asyncio.sleep(0.02)  # Tiny gap so Qt can process each
++                except Exception:
++                    pass
++        print("[HISTORY] History loaded into GUI")
++    except Exception as e:
++        print(f"[HISTORY] Failed to load history: {e}")
++
++
++async def _session_health_monitor():
++    """Runs every 30 minutes to keep session memory bounded for 2-hour sessions."""
++    global latency_history
++    while True:
++        await asyncio.sleep(1800)   # 30 minutes
++        uptime_min = (time.monotonic() - (current_timer.t0 if current_timer else time.monotonic())) / 60
++        print(f"[HEALTH] Session uptime: {uptime_min:.1f} min | "
++              f"Latency samples: {len(latency_history)} | "
++              f"Memory OK")
++        # Prune latency history to prevent unbounded growth
++        if len(latency_history) > 100:
++            latency_history = latency_history[-50:]
++            print("[HEALTH] Pruned latency_history to last 50 samples")
+ 
+ if __name__ == "__main__":
+-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+\ No newline at end of file
++    import sys
++    # If starting as worker, run LiveKit runner directly in console mode
++    if len(sys.argv) > 1 and sys.argv[1] in ["dev", "start", "agent"]:
++        print("[OK] Starting TONY agent worker in console mode...")
++        from livekit.agents.cli import run_app
++        from livekit.agents import WorkerOptions, JobExecutorType
++        run_app(WorkerOptions(entrypoint_fnc=entrypoint, job_executor_type=JobExecutorType.THREAD))
++    else:
++        # Default: run GUI
++        sys.argv = [sys.argv[0]]
++        print("[OK] TONY GUI starting...")
++        
++        # Import and run Tony interface
++        import tony
++        sys.exit(tony.main())

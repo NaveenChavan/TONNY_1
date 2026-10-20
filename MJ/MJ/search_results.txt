@@ -1,0 +1,83 @@
+--- runtime_agent.py ---
+23: sys.modules['agent'] = sys.modules['__main__']
+48: from livekit import agents, rtc
+49: from livekit.agents import Agent, AgentSession, RoomInputOptions
+51: from livekit.plugins import silero
+75: "vad": None,
+155: f"vad={'1' if s['vad'] else '0'} "
+184: AGENT_INSTRUCTION,
+186: AGENT_INSTRUCTION_FOR_TOOLS,
+611: async def speak_local(session: AgentSession, text: str):
+620: async def _say_and_finish(session: AgentSession, text: str):
+664: async def route_command_directly(session: AgentSession, command: str) -> bool:
+1199: async def handle_user_transcript(session: AgentSession, transcript: str, source: str = "voice"):
+1278: # MAIN AGENT
+1280: class UltimateAdvancedTony(Agent):
+1286: self._session: Optional[AgentSession] = None
+1347: AGENT_INSTRUCTION,
+1348: AGENT_INSTRUCTION_FOR_TOOLS,
+1356: def set_session(self, session: AgentSession):
+1502: async def entrypoint(ctx: agents.JobContext):
+1527: # Instantiate Tony agent (creates VAD internally)
+1528: agent = UltimateAdvancedTony()
+1529: _runtime_state["tony_instance"] = agent
+1531: # Create AgentSession — default auto mode (Google-like smooth endpointing)
+1532: # No turn_detection="manual" → LiveKit + Gemini handle VAD automatically
+1533: session = AgentSession()
+1547: def on_user_state_changed(ev: agents.voice.UserStateChangedEvent):
+1554: print("[VAD] speech detected")
+1561: print("[VAD] speech ended")
+1566: def on_user_transcript(ev: agents.voice.UserInputTranscribedEvent):
+1578: @session.on("agent_state_changed")
+1579: def on_agent_state(ev: agents.voice.AgentStateChangedEvent):
+1580: print(f"[AGENT] State changed: {ev.old_state} -> {ev.new_state}")
+1609: # Ensure agent goes back to sleep after Gemini responds
+1621: def on_convo_item(ev: agents.voice.ConversationItemAddedEvent):
+1643: def on_session_close(ev: agents.voice.CloseEvent):
+1652: agent=agent,
+1656: # Improves STT accuracy and reduces false VAD triggers
+1666: agent.set_session(session)
+1718: _runtime_state["vad"] = None
+1776: if len(sys.argv) > 1 and sys.argv[1] in ["dev", "start", "agent"]:
+1777: print("[OK] Starting TONY agent worker in console mode...")
+1778: from livekit.agents.cli import run_app
+1779: from livekit.agents import WorkerOptions, JobExecutorType
+
+--- Mj_agent.py ---
+3: from livekit.agents.utils import images
+9: from livekit import agents
+10: from livekit.agents import AgentSession, Agent, RoomInputOptions
+13: from livekit.agents.llm.chat_context import ChatContext
+28: from livekit.agents import Agent, get_job_context
+29: from livekit.agents.llm import ImageContent
+31: from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
+37: AGENT_INSTRUCTION,
+39: AGENT_INSTRUCTION_FOR_TOOLS
+91: class Assistant(Agent):
+410: """Construct the complete instruction set for the agent."""
+420: AGENT_INSTRUCTION,
+422: AGENT_INSTRUCTION_FOR_TOOLS,
+490: async def generate_startup_message(self, session: AgentSession):
+551: async def entrypoint(ctx: agents.JobContext):
+552: """Main entry point for the agent with retry logic."""
+558: # Create agent first
+559: agent = Assistant()
+561: # Create session with the agent
+562: session = AgentSession()
+569: agent=agent,
+596: await agent._check_reminders()
+598: print("✅ Agent session started successfully and is now live.")
+608: # async def entrypoint(ctx: agents.JobContext):
+609: #     """Main entry point for the agent"""
+611: #         print("🎯 Agent entrypoint starting...")
+627: #         # IMPORTANT: Set video source in GUI BEFORE creating agent
+672: #         # Now create agent and session
+673: #         print("🤖 Creating assistant agent...")
+674: #         agent = Assistant()
+675: #         session = AgentSession()
+677: #         print("🚀 Starting agent session...")
+680: #             agent=agent,
+691: #                 __main__.nova_window.set_assistant(agent)
+700: #         print("🎉 Agent is now fully operational with camera!")
+724: #         # Keep the agent running
+735: agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))

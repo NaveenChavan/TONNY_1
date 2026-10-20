@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.env
+.env.*
+!.env.example
+*.db
+*.log
+*.spec
+*.py[cod]
+build/
+dist/
+venv/
+serviceAccount.json
+memory.json
+chat_log.txt
+saved_face.jpg
+WhatsApp Image*.jpeg
